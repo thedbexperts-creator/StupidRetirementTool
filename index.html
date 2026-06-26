@@ -140,10 +140,10 @@
     <p>This software was written by a moron with no financial training who just watched a bunch of YouTube videos. It has been made available for testing purposes only. Anyone who would make real world decisions based on this tool is a bigger moron than the idiot who vibed it up.</p>
     <p><strong>Use this tool at your own risk. No warranties. No promises.</strong> This is not financial advice. Consult a qualified financial professional before making any retirement planning decisions.</p>
     <div class="ack-row">
-      <input type="checkbox" id="disclaimer-check" onchange="const b=document.getElementById('disclaimer-btn'); b.classList.toggle('ready',this.checked); b.disabled=!this.checked;">
+      <input type="checkbox" id="disclaimer-check" onchange="document.getElementById('disclaimer-btn').classList.toggle('ready', this.checked);">
       <label for="disclaimer-check">I understand and acknowledge that I am using this tool at my own risk.</label>
     </div>
-    <button id="disclaimer-btn" onclick="acknowledgDisclaimer()" disabled>I Understand — Let Me In</button>
+    <button id="disclaimer-btn" onclick="if(document.getElementById('disclaimer-check').checked){document.getElementById('disclaimer-overlay').style.display='none';}else{var b=document.querySelector('.disclaimer-box');b.style.transform='translateX(-8px)';setTimeout(function(){b.style.transform='translateX(8px)'},80);setTimeout(function(){b.style.transform=''},160);}">I Understand — Let Me In</button>
   </div>
 </div>
 
@@ -2004,7 +2004,13 @@ document.querySelectorAll('#sidebar .nav-link').forEach(link => {
 // ── Profile Load/Render ───────────────────────────────────────────────────────
 // ── Disclaimer ───────────────────────────────────────────────────────────────
 function acknowledgDisclaimer() {
-  if (!document.getElementById('disclaimer-check').checked) return;
+  if (!document.getElementById('disclaimer-check').checked) {
+    const box = document.querySelector('.disclaimer-box');
+    box.style.transform = 'translateX(-8px)';
+    setTimeout(() => box.style.transform = 'translateX(8px)', 80);
+    setTimeout(() => box.style.transform = '', 160);
+    return;
+  }
   document.getElementById('disclaimer-overlay').classList.add('hidden');
 }
 
