@@ -1,0 +1,9 @@
+profile.json
+__pycache__/
+dist/
+build/
+*.exe
+*.app
+*.zip
+*.pyc
+.DS_Store
