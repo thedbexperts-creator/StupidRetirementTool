@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.1] - 2026-08-14
+
+### Security
+- Removed the wildcard `Access-Control-Allow-Origin: *` header. While the app was running, any website open in the browser could read the full profile from `GET /api/profile` or overwrite `profile.json` via `POST /api/save`. The local server no longer grants any cross-origin access.
+- Added `Host` header validation so the server only answers requests addressed to `localhost` / `127.0.0.1` (DNS-rebinding protection).
+- Stopped returning Python stack traces (`traceback.format_exc()`) in API error responses; errors now return only a short message.
+- Capped POST request bodies at 5 MB (returns `413`) to prevent memory-exhaustion.
+- `profile.json` writes are now serialized with a lock and written atomically (temp file + `os.replace`) to avoid corruption under the threaded server.
+
+### Fixed
+- **Spousal Social Security reduction** — corrected to the SSA rule (25/36 of 1% per month for the first 36 months, then 5/12 of 1% beyond). The previous factor understated the early-claiming reduction roughly threefold (~9% instead of 25% at 36 months early).
+- **Social Security taxation for single filers** — after a spouse dies, provisional-income thresholds now use the single amounts ($25,000 / $34,000) instead of the married amounts ($32,000 / $44,000), and the second-tier add-on uses the correct `min(50% of benefits, cap)`.
+- **NYS pension early-retirement reductions** — replaced the flat 6⅔%/yr approximation with the official NYS Comptroller reduction tables for ERS Tier 3/4, Tier 5, and Tier 6, interpolated by month (reproduces OSC's published half-year examples exactly). The 30-years-of-service exemption now correctly applies only to Tier 2/3/4, not Tier 5 or Tier 6.
+- **Social Security indexing** — benefits are now indexed by COLA from the current year, keeping them nominal-consistent with inflated expenses (previously the FRA benefit only grew after the claiming age, understating SS for anyone years away from claiming).
+- **RMD required-beginning age** — now follows SECURE 2.0: 73 for those born 1951–1959, 75 for those born 1960 or later (previously hardcoded to 73).
+- **Monte Carlo** — corrected an off-by-one in percentile indexing (nearest-rank), and the dynamic-spending guardrails no longer disable themselves when the first retirement year has no portfolio withdrawal.
+
+---
+
 ## [1.0.0] - 2026-06-27
 
 ### Added
