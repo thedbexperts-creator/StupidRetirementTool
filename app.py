@@ -22,6 +22,7 @@ else:
 
 CURRENT_DIR = _BASE_DIR
 DATA_FILE   = os.path.join(_DATA_DIR, 'profile.json')
+DATA_LOCK   = threading.Lock()   # serialize profile.json reads/writes
 
 # ─── TAX TABLES 2024 (MFJ) ────────────────────────────────────────────────────
 
@@ -337,27 +338,46 @@ def spousal_ss_monthly(own_fra_monthly, partner_fra_monthly, take_age, fra_age=6
         return own
     # Spousal benefit: 50% of partner's PIA, reduced if taken before own FRA
     months_early = max(0, (fra_age - take_age) * 12)
+    base_spousal = 0.5 * partner_fra_monthly
     if months_early == 0:
-        spousal = 0.5 * partner_fra_monthly
+        spousal = base_spousal
     elif months_early <= 36:
-        spousal = 0.5 * partner_fra_monthly * (1 - months_early * 25/10000)
+        # SSA: spousal benefit reduced 25/36 of 1% per month, first 36 months
+        reduction = months_early * (25.0 / 36.0) / 100.0
+        spousal = base_spousal * (1 - reduction)
     else:
-        spousal = 0.5 * partner_fra_monthly * (1 - (36*25 + (months_early-36)*25/12) / 10000)
+        # ...then 5/12 of 1% per month beyond 36 (25% reduction at 36 months)
+        reduction = 0.25 + (months_early - 36) * (5.0 / 12.0) / 100.0
+        spousal = base_spousal * (1 - reduction)
     return max(own, spousal)
 
-def taxable_ss_portion(ss_annual, other_income):
-    """Federal taxable portion of SS benefits."""
-    combined = other_income + 0.5 * ss_annual
-    if combined < 32000:
-        return 0.0
-    elif combined < 44000:
-        return min(0.5 * ss_annual, 0.5 * (combined - 32000))
-    else:
-        return min(0.85 * ss_annual, 0.85 * (combined - 44000) + 6000)
+def taxable_ss_portion(ss_annual, other_income, use_single=False):
+    """Federal taxable portion of SS benefits.
 
-def rmd_required(balance, age):
-    """RMD amount for a traditional account. SECURE 2.0: starts at 73."""
-    if age < 73 or balance <= 0:
+    IRS base amounts depend on filing status and are NOT inflation-indexed
+    (by design). MFJ: 32k/44k; Single: 25k/34k. Second-tier add-on is the
+    smaller of 50% of benefits or 6,000 (MFJ) / 4,500 (Single)."""
+    combined = other_income + 0.5 * ss_annual
+    if use_single:
+        t1, t2, addon_cap = 25000.0, 34000.0, 4500.0
+    else:
+        t1, t2, addon_cap = 32000.0, 44000.0, 6000.0
+    if combined < t1:
+        return 0.0
+    elif combined < t2:
+        return min(0.5 * ss_annual, 0.5 * (combined - t1))
+    else:
+        return min(0.85 * ss_annual,
+                   0.85 * (combined - t2) + min(0.5 * ss_annual, addon_cap))
+
+def rmd_start_age(birth_year):
+    """SECURE 2.0 required-beginning age: 73 for those born 1951-1959,
+    75 for those born 1960 or later."""
+    return 75 if int(birth_year) >= 1960 else 73
+
+def rmd_required(balance, age, start_age=73):
+    """RMD amount for a traditional account. SECURE 2.0 start age varies."""
+    if age < start_age or balance <= 0:
         return 0.0
     return balance / RMD_TABLE.get(min(age, 95), 8.9)
 
@@ -655,8 +675,10 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         pen2_inc = sum(inc for pen, inc in pen_details if pen.get('owner', 'p1') == 'p2')
 
         # ── Social Security ───────────────────────────────────────────────────
-        ss1_ann = ss1_mo * 12 * (1.024 ** max(0, p1a - ss1_age)) if p1a >= ss1_age else 0.0
-        ss2_ann = ss2_mo * 12 * (1.024 ** max(0, p2a - ss2_age)) if p2a >= ss2_age else 0.0
+        # SS entered in today's dollars at FRA; index by COLA from the current
+        # year so it stays nominal-consistent with inflated expenses.
+        ss1_ann = ss1_mo * 12 * (1.024 ** (yr - curr_yr)) if p1a >= ss1_age else 0.0
+        ss2_ann = ss2_mo * 12 * (1.024 ** (yr - curr_yr)) if p2a >= ss2_age else 0.0
 
         # Survivor SS: survivor keeps the HIGHER of the two benefits
         if survivor_active:
@@ -698,8 +720,10 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         rmd_tot = 0.0
         for k, v in acct_defs.items():
             if v['type'] == 'traditional':
-                owner_age = p1a if v.get('owner', 'p1') == 'p1' else p2a
-                r = min(rmd_required(bal[k], owner_age), bal[k])
+                _own = v.get('owner', 'p1')
+                owner_age = p1a if _own == 'p1' else p2a
+                _own_by = p1b if _own == 'p1' else p2b
+                r = min(rmd_required(bal[k], owner_age, rmd_start_age(_own_by)), bal[k])
                 rmds[k] = r
                 rmd_tot += r
             else:
@@ -797,7 +821,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             # Federal: all pension income is ordinary income regardless of NYS exemption
             # Working income is earned income — taxed at regular rates
             fed_ordinary = pen1_inc + pen2_inc + trad_w + savings_interest + working_income
-            tx_ss        = taxable_ss_portion(total_ss, fed_ordinary)
+            tx_ss        = taxable_ss_portion(total_ss, fed_ordinary, use_single)
             fed_ordinary += tx_ss
 
             fed_ltcg_tax = calc_ltcg_tax(taxable_gains, fed_ordinary,
@@ -1183,6 +1207,32 @@ def recommend_spending(profile, target_wealth=0, target_age=None, n_scenarios=5)
 
 # ─── NYS PENSION CALCULATOR ──────────────────────────────────────────────────
 
+NYSLRS_REDUCTION = {
+    # Official NYS Comptroller early-retirement reduction tables (% by age).
+    # Interpolated by month, these reproduce OSC's published half-year examples.
+    'tier34': {62: 0.0, 61: 6.0, 60: 12.0, 59: 15.0, 58: 18.0, 57: 21.0, 56: 24.0, 55: 27.0},
+    'tier5':  {62: 0.0, 61: 6.67, 60: 13.33, 59: 18.33, 58: 23.33, 57: 28.33, 56: 33.33, 55: 38.33},
+    'tier6':  {63: 0.0, 62: 6.5, 61: 13.0, 60: 19.5, 59: 26.0, 58: 32.5, 57: 39.0, 56: 45.5, 55: 52.0},
+}
+
+def nyslrs_reduction(age, table_key, nra):
+    """Early-retirement reduction (fraction) for the given benefit age,
+    interpolated by month between NYSLRS annual anchors."""
+    table = NYSLRS_REDUCTION[table_key]
+    if age >= nra:
+        return 0.0
+    if age <= 55:
+        return table[55] / 100.0
+    lo = int(math.floor(age))
+    hi = lo + 1
+    lo = max(55, min(lo, nra))
+    hi = max(55, min(hi, nra))
+    r_lo = table.get(lo, table[55])
+    r_hi = table.get(hi, 0.0)
+    frac = age - math.floor(age)
+    return (r_lo + (r_hi - r_lo) * frac) / 100.0
+
+
 def calc_nys_pension(params):
     """
     Calculate NYS ERS or PFRS pension benefit from service record.
@@ -1247,8 +1297,9 @@ def calc_nys_pension(params):
             factor = 0.02 if service >= 20 else 0.0175
             gross  = fas * factor * service
             nra    = 62
+            # Tier 2/3/4: 30+ years of service => no early-retirement reduction
             if benefit_start_age < nra and service < 30:
-                reduction = min((nra - benefit_start_age) / 15.0, 0.50)
+                reduction = nyslrs_reduction(benefit_start_age, 'tier34', nra)
             else:
                 reduction = 0.0
             annual = gross * (1.0 - reduction)
@@ -1257,10 +1308,8 @@ def calc_nys_pension(params):
         elif tier == '5':
             gross = fas * 0.02 * service
             nra   = 62
-            if benefit_start_age < nra and service < 30:
-                reduction = min((nra - benefit_start_age) / 15.0, 0.50)
-            else:
-                reduction = 0.0
+            # Tier 5 ERS: the 30-year exemption does NOT apply (NYSLRS)
+            reduction = nyslrs_reduction(benefit_start_age, 'tier5', nra)
             annual = gross * (1.0 - reduction)
             return annual, annual / 12, reduction, gross, 'Tier 5 ERS'
 
@@ -1272,10 +1321,8 @@ def calc_nys_pension(params):
             else:
                 gross = fas * 0.0175 * 20 + fas * 0.02 * 10 + fas * 0.015 * (service - 30)
             nra = 63
-            if benefit_start_age < nra and service < 30:
-                reduction = min((nra - benefit_start_age) / 15.0, 0.50)
-            else:
-                reduction = 0.0
+            # Tier 6 ERS: the 30-year exemption does NOT apply (NYSLRS)
+            reduction = nyslrs_reduction(benefit_start_age, 'tier6', nra)
             annual = gross * (1.0 - reduction)
             return annual, annual / 12, reduction, gross, 'Tier 6 ERS'
 
@@ -1423,15 +1470,21 @@ DEFAULT_PROFILE = {
 # ─── HTTP SERVER ─────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
+    MAX_BODY = 5 * 1024 * 1024  # 5 MB request cap (DoS guard)
+
     def log_message(self, format, *args):
         pass  # Quiet server log
+
+    def _host_ok(self):
+        # Anti DNS-rebinding: only honor requests addressed to localhost.
+        hostname = self.headers.get('Host', '').split(':')[0]
+        return hostname in ('localhost', '127.0.0.1', '::1', '')
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(body)
 
@@ -1448,26 +1501,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_OPTIONS(self):
+        # Same-origin local app; no cross-origin access is granted.
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Content-Length', '0')
         self.end_headers()
 
     def do_GET(self):
+        if not self._host_ok():
+            self.send_response(403); self.end_headers(); return
         if self.path in ('/', '/index.html'):
             self.send_file(os.path.join(CURRENT_DIR, 'index.html'), 'text/html; charset=utf-8')
         elif self.path == '/api/profile':
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE) as f:
-                    self.send_json(json.load(f))
-            else:
-                self.send_json(DEFAULT_PROFILE)
+            with DATA_LOCK:
+                if os.path.exists(DATA_FILE):
+                    with open(DATA_FILE) as f:
+                        profile = json.load(f)
+                else:
+                    profile = DEFAULT_PROFILE
+            self.send_json(profile)
         else:
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
+        if not self._host_ok():
+            self.send_response(403); self.end_headers(); return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (TypeError, ValueError):
+            self.send_json({'error': 'Invalid Content-Length'}, 400); return
+        if length < 0 or length > self.MAX_BODY:
+            self.send_json({'error': 'Request too large'}, 413); return
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -1476,8 +1539,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == '/api/save':
             try:
-                with open(DATA_FILE, 'w') as f:
-                    json.dump(data, f, indent=2)
+                with DATA_LOCK:
+                    tmp = DATA_FILE + '.tmp'
+                    with open(tmp, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    os.replace(tmp, DATA_FILE)
                 self.send_json({'ok': True})
             except Exception as e:
                 self.send_json({'error': str(e)}, 500)
@@ -1488,7 +1554,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': True, 'results': results})
             except Exception as e:
                 import traceback
-                self.send_json({'error': str(e), 'trace': traceback.format_exc()}, 500)
+                self.send_json({'error': str(e)}, 500)
 
         elif self.path == '/api/calculate_no_roth':
             try:
@@ -1503,7 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': True, **result})
             except Exception as e:
                 import traceback
-                self.send_json({'error': str(e), 'trace': traceback.format_exc()}, 500)
+                self.send_json({'error': str(e)}, 500)
 
         elif self.path == '/api/calc_nys_pension':
             try:
@@ -1511,7 +1577,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 import traceback
-                self.send_json({'error': str(e), 'trace': traceback.format_exc()}, 500)
+                self.send_json({'error': str(e)}, 500)
 
         elif self.path == '/api/recommend':
             try:
@@ -1524,7 +1590,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': True, **result})
             except Exception as e:
                 import traceback
-                self.send_json({'error': str(e), 'trace': traceback.format_exc()}, 500)
+                self.send_json({'error': str(e)}, 500)
 
         elif self.path == '/api/monte_carlo':
             try:
@@ -1541,7 +1607,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 import traceback
-                self.send_json({'error': str(e), 'trace': traceback.format_exc()}, 500)
+                self.send_json({'error': str(e)}, 500)
 
         else:
             self.send_response(404); self.end_headers()
@@ -1558,7 +1624,8 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
     """
     n_sims   = len(all_shocks)
     n_years  = len(withdrawals)
-    initial_wr = withdrawals[0] / start_bal if start_bal > 0 else 0
+    _first_w = next((w for w in withdrawals if w > 0), 0.0)
+    initial_wr = _first_w / start_bal if start_bal > 0 else 0
 
     all_balances   = []
     depletion_ages = []
@@ -1605,7 +1672,7 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
     # ── Percentiles ────────────────────────────────────────────────────────
     percentiles = {}
     for pct in [10, 25, 50, 75, 90]:
-        idx = max(0, min(n_sims - 1, int(round(n_sims * pct / 100))))
+        idx = max(0, min(n_sims - 1, int(math.ceil(n_sims * pct / 100.0)) - 1))
         percentiles[str(pct)] = [
             sorted(s[y] for s in all_balances)[idx]
             for y in range(n_years)
