@@ -73,5 +73,101 @@ PFRS is still modeled as a simplified 2%/yr (max 60%) plan without the special
 assumptions decoupled from the user's inflation input. These are reasonable for a
 planning estimate but are approximations.
 
+Still not modeled: brokerage dividends and capital-gain distributions (taxable
+accounts defer all tax until sale); survivor Social Security when the deceased
+had not yet claimed; RMDs on inherited accounts; the Tier 6 FAS 10%-per-year
+growth cap; and the spousal-benefit rule that a partner must have filed before
+a spousal benefit can begin.
+
+---
+
+# Round 2 — fixes applied 2026-08-18 (v1.0.2)
+
+A second review found further defects, all in `app.py` unless noted. Every fix
+below was verified by running the engine before and after. See `CHANGELOG.md`
+for the full list; the load-bearing ones:
+
+## Roth conversions (all three were severe)
+
+13. **The conversion tax was computed, reported, and never actually paid.**
+    No account was ever debited for it, so converting was free money and the
+    optimizer maximized it. Measured on a $2.2M portfolio: `fill_24` reported
+    an ending balance $2.0M *higher* than `none`. The tax is now paid from
+    taxable/savings first (the optimal real-world approach) and withheld from
+    the conversion when there is no outside cash; an unaffordable conversion is
+    scaled back by bisection.
+
+14. **A conversion with no Roth account deleted the money.** The traditional
+    balance was debited unconditionally but only credited `if roth_keys:`.
+    With the Roth rows removed from a test profile the ending balance went from
+    $9.48M to **$0**. Conversions are now skipped with a note surfaced in the UI.
+
+15. **Conversions never fired for single-person profiles.** A disabled person 2
+    was given a retirement year of 9999, so `both_ret` was never true.
+
+## Engine
+
+16. **Working salary was spent twice** — fully available for expenses *and*
+    fully contributed. Contributions now come out of salary, are capped at
+    earned income, and pre-tax ones reduce taxable income.
+17. **A disabled person 2 kept contributing forever** (same 9999 sentinel).
+18. **Person 2's life expectancy was ignored** — it bounded the loop but never
+    killed them, so they collected SS and incurred expenses to the end.
+19. **Retirement-phase contributions to taxable accounts skipped basis**,
+    unlike the accumulation phase.
+20. **Capital gains were left out of SS provisional income** and out of the
+    bracket headroom used to size conversions.
+21. **HYSA interest was only taxed on withdrawal.** Now taxed as earned and
+    credited to basis (savings basis defaults to the full balance, not 80%).
+22. **IRMAA** used un-indexed 2024 thresholds against inflated income (everyone
+    reached the top tier eventually) and a MAGI proxy that excluded the
+    withdrawals and conversions that actually cause the surcharge. Now uses the
+    real MAGI from two years prior with indexed thresholds and premiums.
+23. **The SS optimizer's score double-counted benefits** (`lifetime SS + final
+    balance − tax`, but SS already flows into the balance). Score is now the
+    ending balance; scenarios that deplete rank last.
+24. **NYS benefit formulas were wrong** — 1.66%/yr below 20 years of service,
+    not 1.75%; 1.5% past 30 years for Tiers 3/4/5; and no 1.5% tier for Tier 6.
+    Verified: Tier 4 @35 yrs = 67.5% of FAS, Tier 6 @25 yrs = 45%.
+    (The reduction tables from round 1 were correct and are unchanged.)
+25. **The RMD table stopped at 95**, defaulting to an 8.9 divisor forever after.
+    Extended to 120.
+26. **Shortfalls were inflated** by the gross-up loop iterating against empty
+    accounts; now the true unfunded after-tax gap.
+27. **The glide path overrode the cash/HYSA rate**; it now applies only to
+    invested accounts.
+28. **The FICA wage base was indexed off the profile year, not 2024** (two
+    years stale), and **FICA disappeared from `total_tax`** in Roth years.
+29. **The state pension exclusion sheltered wages, interest and capital gains**
+    rather than only pension/IRA income; NY's exclusion begins at 59½.
+30. **Monte Carlo mixed log and simple returns** — `drift = growth − σ²/2` is a
+    log-space quantity but was applied as `bal × (1 + drift + shock)`. Now
+    `bal × exp(drift + shock)` with `drift = ln(1+growth) − σ²/2`. Guardrail
+    trigger counting and the initial-withdrawal-rate anchor were also corrected.
+
+## Security
+
+31. **CSRF write to `/api/save` was still possible.** Round 1 removed the
+    wildcard CORS header, which blocks cross-origin *reads* — but an HTML form
+    POST is a "simple request" with no preflight, and the handler ignored
+    `Content-Type` and just parsed the body as JSON. Any page open in the
+    browser could overwrite or wipe `profile.json`. POSTs now require a
+    same-origin `Origin`/`Sec-Fetch-Site` and `application/json`.
+32. **A missing `Host` header bypassed the rebinding check** (`''` was allowed).
+33. **`/api/save` accepted any JSON**, so a malformed payload could replace a
+    good profile and break every later calculation. It is now validated,
+    including a trial projection.
+34. **Errors were invisible on both ends** — round 1 removed the traceback from
+    the response but never logged it. Tracebacks now go to the server's stderr.
+
+## Robustness / housekeeping
+
+35. Profile fields are coerced through a shared `_num()` / `normalize_accounts()`
+    path, so `"1,234"`, `null`, missing `type` keys and wrong-typed lists no
+    longer raise a bare `KeyError` mid-projection.
+36. `APP_VERSION` + `/api/version` now exist and are displayed in the topbar —
+    the 1.0.0 changelog had claimed this feature, but it was never implemented.
+37. Removed the four leftover no-op `import traceback` statements.
+
 > The original author's disclaimer still applies: this is a planning estimate,
 > not financial advice.

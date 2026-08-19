@@ -6,8 +6,9 @@ Open: http://localhost:5000
 """
 
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-import json, math, os, copy, random, sys, threading, webbrowser
+import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
+APP_VERSION = '1.0.2'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.
@@ -97,7 +98,8 @@ STATE_TAX_DATA = {
            'brackets_single':[(8500,0.040),(11700,0.045),(13900,0.0525),
                                (80650,0.0585),(215400,0.0625),(1077550,0.0685),(_INF,0.0965)],
            'std_ded_mfj':16050,'std_ded_single':8000,
-           'ss_taxable_pct':0.0,'pension_excl_per_person':20000,'pension_excl_age':60},
+           # NY's $20k pension/annuity exclusion starts at age 59½.
+           'ss_taxable_pct':0.0,'pension_excl_per_person':20000,'pension_excl_age':59.5},
     'CA': {'name':'California','type':'progressive',
            'brackets_mfj':   [(20824,0.01),(49368,0.02),(77918,0.04),(108162,0.06),
                                (136700,0.08),(698274,0.093),(837922,0.103),(1000000,0.113),(_INF,0.133)],
@@ -176,7 +178,7 @@ def get_state_tax_config(profile):
         return zero, 0, zero, 0, 0.0, 0, 0
 
     if stype == 'custom':
-        rate = float(profile.get('custom_state_rate', 0.0)) / 100.0
+        rate = _num(profile.get('custom_state_rate'), 0.0) / 100.0
         b = [(float('inf'), rate)]
         return b, 0, b, 0, 0.0, 0, 0
 
@@ -219,15 +221,75 @@ LTCG_BRACKETS_SINGLE = [
 ]
 # NYS taxes capital gains as ordinary income (no special rate)
 
-# IRS Uniform Lifetime Table (RMDs, SECURE 2.0: start age 73)
+# IRS Uniform Lifetime Table (RMDs, SECURE 2.0: start age 73 or 75).
+# Runs to 120+ so long life expectancies keep getting the correct divisor
+# (a truncated table understates forced distributions and their tax).
 RMD_TABLE = {
-    73:26.5, 74:25.5, 75:24.6, 76:23.7, 77:22.9,
+    72:27.4, 73:26.5, 74:25.5, 75:24.6, 76:23.7, 77:22.9,
     78:22.0, 79:21.1, 80:20.2, 81:19.4, 82:18.5, 83:17.7,
     84:16.8, 85:16.0, 86:15.2, 87:14.4, 88:13.7, 89:12.9,
-    90:12.2, 91:11.5, 92:10.8, 93:10.1, 94:9.5,  95:8.9
+    90:12.2, 91:11.5, 92:10.8, 93:10.1, 94:9.5,  95:8.9,
+    96:8.4,  97:7.8,  98:7.3,  99:6.8,  100:6.4, 101:6.0,
+    102:5.6, 103:5.2, 104:4.9, 105:4.6, 106:4.3, 107:4.1,
+    108:3.9, 109:3.7, 110:3.5, 111:3.4, 112:3.3, 113:3.1,
+    114:3.0, 115:2.9, 116:2.8, 117:2.7, 118:2.5, 119:2.3,
+    120:2.0
 }
 
 # ─── FINANCIAL HELPERS ────────────────────────────────────────────────────────
+
+def _num(value, default=0.0):
+    """Coerce a profile field to float. Tolerates None, '', and '1,234.56'.
+
+    Profiles are hand-editable JSON and the UI sends some fields as strings,
+    so a missing or malformed number must not take down a whole projection.
+    """
+    if value is None:
+        return float(default)
+    if isinstance(value, bool):
+        return float(default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(',', '').replace('$', '').strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _dict_list(value):
+    """Coerce a profile field to a list of dicts, dropping anything else."""
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, dict)]
+
+
+ACCOUNT_TYPES = ('traditional', 'roth', 'taxable', 'savings')
+
+
+def normalize_accounts(raw_accounts):
+    """Return a sanitized copy of the accounts dict.
+
+    Guarantees every account has a valid 'type', a numeric 'balance', and
+    numeric growth rates, so the engine can index them directly without a
+    KeyError taking out the request.
+    """
+    out = {}
+    for k, v in (raw_accounts or {}).items():
+        if not isinstance(v, dict):
+            continue
+        a = dict(v)
+        t = str(a.get('type', 'taxable')).strip().lower()
+        a['type'] = t if t in ACCOUNT_TYPES else 'taxable'
+        a['balance'] = max(0.0, _num(a.get('balance', 0)))
+        a['owner'] = 'p2' if str(a.get('owner', 'p1')).lower() == 'p2' else 'p1'
+        a['growth_rate'] = _num(a.get('growth_rate', 0.07), 0.07)
+        if a.get('ret_growth') is None:
+            a['ret_growth'] = a['growth_rate'] * 0.85
+        else:
+            a['ret_growth'] = _num(a.get('ret_growth'), a['growth_rate'] * 0.85)
+        out[k] = a
+    return out
+
 
 def adj_brackets(brackets, ded, inflation, years):
     """Adjust tax brackets for inflation."""
@@ -310,13 +372,19 @@ IRMAA_SINGLE = [
     (float('inf'), 10096),
 ]
 
-def irmaa_annual_per_person(magi, use_single=False):
-    """Annual Medicare Part B+D premium (standard + IRMAA surcharge) per person."""
+def irmaa_annual_per_person(magi, use_single=False, threshold_factor=1.0, premium_factor=1.0):
+    """Annual Medicare Part B+D premium (standard + IRMAA surcharge) per person.
+
+    IRMAA thresholds are CPI-indexed each year and premiums rise with medical
+    costs, so both are scaled forward rather than held at their 2024 nominal
+    values — otherwise inflated income drifts into the top tier over a 30-year
+    projection and everyone looks like a high earner.
+    """
     table = IRMAA_SINGLE if use_single else IRMAA_MFJ
     for threshold, annual in table:
-        if magi <= threshold:
-            return annual
-    return table[-1][1]
+        if magi <= threshold * threshold_factor:
+            return annual * premium_factor
+    return table[-1][1] * premium_factor
 
 def ss_monthly_at_age(fra_monthly, take_age, fra_age=67):
     """SS monthly benefit adjusted for early/late claiming."""
@@ -379,41 +447,49 @@ def rmd_required(balance, age, start_age=73):
     """RMD amount for a traditional account. SECURE 2.0 start age varies."""
     if age < start_age or balance <= 0:
         return 0.0
-    return balance / RMD_TABLE.get(min(age, 95), 8.9)
+    return balance / RMD_TABLE.get(min(int(age), 120), 2.0)
 
 def pension_income_for_year(pension_def, person_age):
     """Annual pension income for a given age."""
-    if not pension_def or person_age < pension_def.get('start_age', 65):
+    if not pension_def:
         return 0.0
-    active_yrs = person_age - pension_def.get('start_age', 65)
-    return pension_def.get('monthly_benefit', 0) * 12 * (1 + pension_def.get('cola', 0.0)) ** active_yrs
+    start_age = _num(pension_def.get('start_age'), 65)
+    if person_age < start_age:
+        return 0.0
+    active_yrs = person_age - start_age
+    monthly = _num(pension_def.get('monthly_benefit'), 0)
+    cola    = _num(pension_def.get('cola'), 0.0)
+    return monthly * 12 * (1 + cola) ** active_yrs
 
 # ─── PROJECTION ENGINE ────────────────────────────────────────────────────────
 
 def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True):
     """
     Year-by-year retirement projection.
-    Returns list of annual snapshots from current_year to p1 age 95.
+
+    Returns a list of annual snapshots from `current_year` until the last
+    person alive reaches their life expectancy.
     """
-    p1 = profile['person1']
-    p2 = profile['person2']
+    p1 = profile.get('person1') or {}
+    p2 = profile.get('person2') or {}
     p2_enabled = bool(p2.get('enabled', True))   # False → single-person / single-filer mode
-    p1b = int(p1['birth_year'])
-    p2b = int(p2['birth_year'])
-    curr_yr = int(profile.get('current_year', 2026))
-    inflation = float(profile.get('inflation', 0.03))
+    p1b = int(_num(p1.get('birth_year'), 1970))
+    p2b = int(_num(p2.get('birth_year'), 1970))
+    curr_yr = int(_num(profile.get('current_year'), 2026))
+    inflation = _num(profile.get('inflation'), 0.03)
     tax_inf = 0.025   # tax brackets inflate slightly slower
-    acct_defs = profile['accounts']
-    contribs   = profile.get('contributions', {})
-    catch_ups  = profile.get('catch_up_contributions', {})   # age 50+
-    super_cups = profile.get('super_catch_up_contributions', {})  # ages 60-63 (SECURE 2.0)
+    acct_defs = normalize_accounts(profile.get('accounts'))
+    contribs   = profile.get('contributions', {}) or {}
+    catch_ups  = profile.get('catch_up_contributions', {}) or {}   # age 50+
+    super_cups = profile.get('super_catch_up_contributions', {}) or {}  # ages 60-63 (SECURE 2.0)
     # Pensions — dynamic array; backward compat with old pension1/pension2 keys
     pensions_list = profile.get('pensions', None)
     if pensions_list is None:
         pen1_old = profile.get('pension1') or profile.get('nys_pension', {})
         pen2_old = profile.get('pension2') or {}
         pensions_list = [p for p in [pen1_old, pen2_old] if p]
-    annual_exp = float(profile.get('annual_expenses', 0))
+    pensions_list = _dict_list(pensions_list)
+    annual_exp = _num(profile.get('annual_expenses'), 0)
 
     # State tax configuration
     (st_brackets_mfj, st_std_ded_mfj,
@@ -422,110 +498,123 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
      st_pension_excl_pp, st_pension_excl_age) = get_state_tax_config(profile)
 
     # One-time expense shocks: [{label, p1_age, amount}]
-    shocks = profile.get('shocks', [])
+    shocks = _dict_list(profile.get('shocks'))
     # Build lookup: p1_age -> total shock amount that year
     shock_by_age = {}
     for sh in shocks:
-        try:
-            age = int(sh.get('p1_age', 0))
-            amt = float(str(sh.get('amount', 0)).replace(',',''))
-            if age > 0 and amt > 0:
-                shock_by_age[age] = shock_by_age.get(age, 0.0) + amt
-        except (ValueError, TypeError):
-            pass
+        age = int(_num(sh.get('p1_age'), 0))
+        amt = _num(sh.get('amount'), 0)
+        if age > 0 and amt > 0:
+            shock_by_age[age] = shock_by_age.get(age, 0.0) + amt
 
     # Survivor scenario: one spouse dies at a given age
-    surv_cfg   = profile.get('survivor', {})
+    surv_cfg   = profile.get('survivor') or {}
     surv_on    = bool(surv_cfg.get('enabled', False))
     surv_who   = surv_cfg.get('person', 'p2')   # 'p1' or 'p2'
-    surv_age   = int(surv_cfg.get('death_age', 80))    # p1 age when death occurs
-    surv_exp   = float(surv_cfg.get('expense_pct', 0.70))  # expenses drop to this %
+    surv_age   = int(_num(surv_cfg.get('death_age'), 80))  # p1 age when death occurs
+    surv_exp   = _num(surv_cfg.get('expense_pct'), 0.70)   # expenses drop to this %
 
     # Spending phases — age-based multiplier on base expenses
-    spend_phases = profile.get('spending_phases', [])
     # Sort by through_age so lookup is in order
-    spend_phases = sorted(spend_phases, key=lambda p: p.get('through_age', 999))
+    spend_phases = sorted(_dict_list(profile.get('spending_phases')),
+                          key=lambda p: _num(p.get('through_age'), 999))
 
     def spending_multiplier(age):
         for ph in spend_phases:
-            if age <= ph.get('through_age', 999):
-                return float(ph.get('multiplier', 1.0))
-        return spend_phases[-1].get('multiplier', 1.0) if spend_phases else 1.0
+            if age <= _num(ph.get('through_age'), 999):
+                return _num(ph.get('multiplier'), 1.0)
+        return _num(spend_phases[-1].get('multiplier'), 1.0) if spend_phases else 1.0
 
     # Medical costs — pre-Medicare vs post-Medicare
-    medical = profile.get('medical', {})
-    med_pre   = float(medical.get('pre_medicare_annual', 0))
-    med_post  = float(medical.get('post_medicare_annual', 0))
-    med_age   = int(medical.get('medicare_age', 65))
-    med_inf   = float(medical.get('inflation_rate', 0.05))
+    medical = profile.get('medical') or {}
+    med_pre   = _num(medical.get('pre_medicare_annual'), 0)
+    med_post  = _num(medical.get('post_medicare_annual'), 0)
+    med_age   = int(_num(medical.get('medicare_age'), 65))
+    med_inf   = _num(medical.get('inflation_rate'), 0.05)
     use_irmaa = bool(medical.get('use_irmaa', True))
 
     # ── ACA premiums (pre-Medicare gap) ───────────────────────────────────────
-    aca_cfg   = profile.get('aca', {})
+    aca_cfg   = profile.get('aca') or {}
     aca_on    = bool(aca_cfg.get('enabled', False))
-    aca_mo    = float(aca_cfg.get('monthly_premium', 0))   # estimated full benchmark premium
-    aca_inf   = float(aca_cfg.get('inflation', 0.05))
+    aca_mo    = _num(aca_cfg.get('monthly_premium'), 0)   # estimated full benchmark premium
+    aca_inf   = _num(aca_cfg.get('inflation'), 0.05)
 
     # ── Long-term care ────────────────────────────────────────────────────────
-    ltc_cfg   = profile.get('ltc', {})
+    ltc_cfg   = profile.get('ltc') or {}
     ltc_on    = bool(ltc_cfg.get('enabled', False))
     # Per-person LTC config: [{person:'p1', start_age:82, duration:3, monthly_cost:0, insurance_monthly:0}]
-    ltc_events = ltc_cfg.get('events', [])
+    ltc_events = _dict_list(ltc_cfg.get('events'))
 
     # ── Asset allocation glide path ───────────────────────────────────────────
-    glide_cfg      = profile.get('glide_path', {})
+    glide_cfg      = profile.get('glide_path') or {}
     glide_on       = bool(glide_cfg.get('enabled', False))
-    glide_eq_start = float(glide_cfg.get('equity_pct_start', 60)) / 100.0
-    glide_eq_end   = float(glide_cfg.get('equity_pct_end',   40)) / 100.0
-    glide_age_start = int(glide_cfg.get('age_start', 65))
-    glide_age_end   = int(glide_cfg.get('age_end',   80))
-    glide_stock_ret = float(glide_cfg.get('stock_return', 8.0)) / 100.0
-    glide_bond_ret  = float(glide_cfg.get('bond_return',  3.5)) / 100.0
+    glide_eq_start = _num(glide_cfg.get('equity_pct_start'), 60) / 100.0
+    glide_eq_end   = _num(glide_cfg.get('equity_pct_end'),   40) / 100.0
+    glide_age_start = int(_num(glide_cfg.get('age_start'), 65))
+    glide_age_end   = int(_num(glide_cfg.get('age_end'),   80))
+    glide_stock_ret = _num(glide_cfg.get('stock_return'), 8.0) / 100.0
+    glide_bond_ret  = _num(glide_cfg.get('bond_return'),  3.5) / 100.0
 
-    strat = profile.get('strategy', {})
-    ss1_age = ss1_age_override if ss1_age_override is not None else int(strat.get('ss1_age', p1.get('fra_age', 67)))
-    ss2_age = ss2_age_override if ss2_age_override is not None else int(strat.get('ss2_age', p2.get('fra_age', 67)))
+    strat = profile.get('strategy') or {}
+    p1_fra_age = int(_num(p1.get('fra_age'), 67))
+    p2_fra_age = int(_num(p2.get('fra_age'), 67))
+    ss1_age = int(_num(ss1_age_override if ss1_age_override is not None
+                       else strat.get('ss1_age'), p1_fra_age))
+    ss2_age = int(_num(ss2_age_override if ss2_age_override is not None
+                       else strat.get('ss2_age'), p2_fra_age))
 
     # Spousal SS: each person gets max(own benefit, 50% of partner's PIA)
-    p1_fra_mo = float(p1.get('ss_fra_monthly', 0))
-    p2_fra_mo = float(p2.get('ss_fra_monthly', 0)) if p2_enabled else 0.0
-    ss1_mo = spousal_ss_monthly(p1_fra_mo, p2_fra_mo, ss1_age, int(p1.get('fra_age', 67)))
-    ss2_mo = 0.0 if not p2_enabled else spousal_ss_monthly(p2_fra_mo, p1_fra_mo, ss2_age, int(p2.get('fra_age', 67)))
+    p1_fra_mo = _num(p1.get('ss_fra_monthly'), 0)
+    p2_fra_mo = _num(p2.get('ss_fra_monthly'), 0) if p2_enabled else 0.0
+    ss1_mo = spousal_ss_monthly(p1_fra_mo, p2_fra_mo, ss1_age, p1_fra_age)
+    ss2_mo = 0.0 if not p2_enabled else spousal_ss_monthly(p2_fra_mo, p1_fra_mo, ss2_age, p2_fra_age)
 
     # Current gross annual income for each person while working
-    p1_gross_income = float(p1.get('annual_income', 0))
-    p2_gross_income = float(p2.get('annual_income', 0)) if p2_enabled else 0.0
+    p1_gross_income = _num(p1.get('annual_income'), 0)
+    p2_gross_income = _num(p2.get('annual_income'), 0) if p2_enabled else 0.0
 
     # FICA tax helper — employee share (SS 6.2% up to wage base + Medicare 1.45%)
-    # SS wage base grows ~4% / yr from the 2024 base of $168,600
+    # SS wage base grows ~4% / yr from the 2024 base of $168,600.
+    # Indexed off 2024 (like the tax brackets), not off the profile's current
+    # year, so the base is correct in the projection's first year.
     SS_WAGE_BASE_2024 = 168_600.0
-    def fica_tax(gross, yrs_elapsed):
-        wage_base = SS_WAGE_BASE_2024 * (1.04 ** yrs_elapsed)
+    def fica_tax(gross, yrs_from_2024):
+        wage_base = SS_WAGE_BASE_2024 * (1.04 ** max(0, yrs_from_2024))
         ss_tax  = min(gross, wage_base) * 0.062
         med_tax = gross * 0.0145
         return ss_tax + med_tax
 
-    p1_retire_yr = p1b + int(p1.get('retirement_age', 65))
-    # When P2 is disabled treat them as never retiring (far future year)
-    p2_retire_yr = p2b + int(p2.get('retirement_age', 65)) if p2_enabled else 9999
-    first_retire_yr = min(p1_retire_yr, p2_retire_yr)
+    p1_retire_yr = p1b + int(_num(p1.get('retirement_age'), 65))
+    p2_retire_yr = p2b + int(_num(p2.get('retirement_age'), 65))
 
     # Deep-copy starting balances
     bal = {k: float(v['balance']) for k, v in acct_defs.items()}
 
-    # Cost basis for taxable/savings accounts (contributions in, not growth)
-    # Default: assume current balance is 80% basis / 20% unrealized gain
+    # Cost basis for taxable/savings accounts (contributions in, not growth).
+    # Brokerage default: current balance is 80% basis / 20% unrealized gain.
+    # Savings/HYSA has no unrealized gain — its interest is taxed as it is
+    # earned (below), so basis tracks the balance and withdrawals realize
+    # nothing further.
     basis = {}
     for k, v in acct_defs.items():
-        if v['type'] in ('taxable', 'savings'):
-            basis[k] = float(v.get('cost_basis', float(v['balance']) * 0.80))
+        if v['type'] == 'taxable':
+            default_basis = v['balance'] * 0.80
+        elif v['type'] == 'savings':
+            default_basis = v['balance']
         else:
             basis[k] = 0.0
+            continue
+        cb = v.get('cost_basis')
+        basis[k] = _num(cb, default_basis) if cb is not None else default_basis
 
     results = []
-    p1_end = p1b + int(p1.get('life_expectancy', 95))
-    p2_end = p2b + int(p2.get('life_expectancy', 90)) if p2_enabled else 0
+    # Life expectancy bounds the projection AND governs when each person dies.
+    p1_end = p1b + int(_num(p1.get('life_expectancy'), 95))
+    p2_end = p2b + int(_num(p2.get('life_expectancy'), 90)) if p2_enabled else 0
     end_year = max(p1_end, p2_end)
+
+    # MAGI by year, for the Medicare IRMAA 2-year lookback.
+    magi_by_year = {}
 
     for yr in range(curr_yr, end_year + 1):
         p1a = yr - p1b
@@ -533,27 +622,47 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         yrs_since_2024 = yr - 2024
 
         p1_ret = yr >= p1_retire_yr
-        p2_ret = yr >= p2_retire_yr
+        # P2 only "retires" if they exist. `both_ret` means "nobody in the
+        # household is still working", which for a single-person profile is
+        # simply p1 being retired — otherwise Roth conversions (gated on
+        # both_ret) could never fire for a single filer.
+        p2_ret = (yr >= p2_retire_yr) if p2_enabled else False
         any_ret = p1_ret or p2_ret
-        both_ret = p1_ret and p2_ret
+        both_ret = p1_ret and (p2_ret or not p2_enabled)
+        p1_working = not p1_ret
+        p2_working = p2_enabled and not p2_ret
 
         # ── ACCUMULATION PHASE (no one retired yet) ──────────────────────────
         if not any_ret:
             for k, v in acct_defs.items():
-                owner_age = p1a if v.get('owner', 'p1') == 'p1' else p2a
-                c = float(contribs.get(k, 0))
+                owner = v['owner']
+                # A disabled person 2 has no accounts to fund.
+                if owner == 'p2' and not p2_enabled:
+                    bal[k] *= (1 + v['growth_rate'])
+                    continue
+                owner_age = p1a if owner == 'p1' else p2a
+                c = _num(contribs.get(k, 0))
                 # Catch-up contributions (age 50+)
                 if owner_age >= 50:
                     if owner_age >= 60 and owner_age <= 63:
                         # SECURE 2.0 super catch-up replaces standard catch-up
-                        c += float(super_cups.get(k, catch_ups.get(k, 0)))
+                        c += _num(super_cups.get(k, catch_ups.get(k, 0)))
                     else:
-                        c += float(catch_ups.get(k, 0))
+                        c += _num(catch_ups.get(k, 0))
                 bal[k] = max(0.0, bal[k] + c)
                 if v['type'] in ('taxable', 'savings'):
                     basis[k] += c        # contributions add to basis
-                bal[k] *= (1 + float(v.get('growth_rate', 0.07)))
-                # growth does NOT increase basis
+                if v['type'] == 'savings':
+                    # HYSA interest is taxed as it is earned, so it is basis too.
+                    basis[k] += bal[k] * v['growth_rate']
+                bal[k] *= (1 + v['growth_rate'])
+                # growth does NOT increase basis (except savings interest, above)
+
+            # MAGI for the IRMAA 2-year lookback: wages while still working.
+            magi_by_year[yr] = (
+                (p1_gross_income * (1 + inflation) ** (yr - curr_yr)) +
+                (p2_gross_income * (1 + inflation) ** (yr - curr_yr))
+            )
 
             total_bal = sum(bal.values())
             results.append({
@@ -573,17 +682,24 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
 
         # ── RETIREMENT PHASE ─────────────────────────────────────────────────
 
-        # ── Survivor scenario — has one spouse died this year? ────────────────
-        # surv_age is stored as p1_age at time of death.
-        p1_alive = True
-        p2_alive = True
-        survivor_active = False
+        # ── Who is still alive? ──────────────────────────────────────────────
+        # Each person's life expectancy governs their death, not just the
+        # length of the projection — otherwise the shorter-lived spouse keeps
+        # drawing Social Security and incurring expenses to the end of the run.
+        # The optional survivor scenario can kill someone off earlier still.
+        p1_alive = yr <= p1_end
+        p2_alive = p2_enabled and yr <= p2_end
         if surv_on and p1a >= surv_age:
-            survivor_active = True
             if surv_who == 'p1':
                 p1_alive = False
             else:
                 p2_alive = False
+        # Everyone has died — the projection is over.
+        if not p1_alive and not p2_alive:
+            break
+
+        # Exactly one member of a couple remaining → survivor rules apply.
+        survivor_active = p2_enabled and (p1_alive != p2_alive)
 
         # ── Tax filing status (single vs MFJ) ────────────────────────────────
         use_single = survivor_active or not p2_enabled
@@ -620,32 +736,46 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         if ltc_on:
             for ev in ltc_events:
                 who       = ev.get('person', 'p1')
-                ev_age    = int(ev.get('start_age', 82))
-                duration  = int(ev.get('duration', 3))
-                mo_cost   = float(ev.get('monthly_cost', 8000))
-                mo_insure = float(ev.get('insurance_monthly', 0))
+                ev_age    = int(_num(ev.get('start_age'), 82))
+                duration  = int(_num(ev.get('duration'), 3))
+                mo_cost   = _num(ev.get('monthly_cost'), 8000)
+                mo_insure = _num(ev.get('insurance_monthly'), 0)
                 net_mo    = max(0.0, mo_cost - mo_insure)
                 ev_age_check = p1a if who == 'p1' else p2a
                 ev_alive     = p1_alive if who == 'p1' else p2_alive
                 if ev_alive and ev_age <= ev_age_check < ev_age + duration:
                     ltc_exp += net_mo * 12 * (1 + med_inf) ** med_yrs
 
-        # IRMAA pre-estimate (using annual pension + SS benefit as MAGI proxy)
-        # Pension income proxy: monthly_benefit * 12 * COLA^active_yrs for each pension at owner's age
+        # ── IRMAA (Medicare high-income surcharge) ───────────────────────────
+        # Uses the MAGI actually computed two years earlier — the SSA lookback
+        # period — so traditional withdrawals, RMDs and Roth conversions all
+        # count, not just pensions and Social Security. Thresholds are CPI
+        # indexed and the premiums track medical inflation.
         irmaa_cost = 0.0
         if use_irmaa:
-            pen_proxy_ann = sum(
-                pension_income_for_year(pen, p1a if pen.get('owner','p1')=='p1' else p2a)
-                for pen in pensions_list
-            )
-            ss1_proxy = ss1_mo * 12 if p1a >= ss1_age else 0.0
-            ss2_proxy = ss2_mo * 12 if (p2_enabled and p2a >= ss2_age) else 0.0
-            magi_proxy = pen_proxy_ann + ss1_proxy + ss2_proxy
-            p1_irmaa_est = irmaa_annual_per_person(magi_proxy, use_single) if (p1_alive and p1a >= med_age and p1_ret) else 0
-            p2_irmaa_est = irmaa_annual_per_person(magi_proxy, use_single) if (p2_enabled and p2_alive and p2a >= med_age and p2_ret) else 0
-            base_post_est = per_post * med_factor * ((1 if p1_alive and p1a >= med_age and p1_ret else 0) +
-                                                      (1 if p2_enabled and p2_alive and p2a >= med_age and p2_ret else 0))
-            irmaa_cost = max(0.0, (p1_irmaa_est + p2_irmaa_est) - base_post_est)
+            if (yr - 2) in magi_by_year:
+                magi_lookback = magi_by_year[yr - 2]
+            else:
+                # First two years of the projection have no prior-year MAGI —
+                # fall back to the guaranteed-income proxy.
+                pen_proxy_ann = sum(
+                    pension_income_for_year(pen, p1a if pen.get('owner','p1')=='p1' else p2a)
+                    for pen in pensions_list
+                )
+                ss1_proxy = ss1_mo * 12 if p1a >= ss1_age else 0.0
+                ss2_proxy = ss2_mo * 12 if (p2_enabled and p2a >= ss2_age) else 0.0
+                magi_lookback = pen_proxy_ann + ss1_proxy + ss2_proxy
+            irmaa_thr_factor = (1 + tax_inf) ** max(0, yrs_since_2024)
+            irmaa_prem_factor = (1 + med_inf) ** med_yrs
+            p1_on_medicare = p1_alive and p1a >= med_age and p1_ret
+            p2_on_medicare = p2_enabled and p2_alive and p2a >= med_age and p2_ret
+            per_person_prem = irmaa_annual_per_person(
+                magi_lookback, use_single, irmaa_thr_factor, irmaa_prem_factor)
+            n_on_medicare = (1 if p1_on_medicare else 0) + (1 if p2_on_medicare else 0)
+            # The profile's post-Medicare medical budget is assumed to already
+            # include the standard Part B/D premium, so only charge the excess.
+            base_post_est = per_post * med_factor * n_on_medicare
+            irmaa_cost = max(0.0, per_person_prem * n_on_medicare - base_post_est)
 
         medical_exp = p1_med + p2_med + aca_exp + ltc_exp
 
@@ -659,12 +789,12 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         # If the owner dies (survivor scenario), switch to survivor monthly benefit.
         def _pen_inc(pen, p1_alive, p2_alive):
             pen_owner      = pen.get('owner', 'p1')
-            pen_survivor_mo = float(pen.get('survivor_monthly', 0))
+            pen_survivor_mo = _num(pen.get('survivor_monthly'), 0)
             owner_age      = p1a if pen_owner == 'p1' else p2a
             owner_alive    = p1_alive if pen_owner == 'p1' else p2_alive
             if survivor_active and not owner_alive and pen_survivor_mo > 0:
-                yrs_collecting = max(0, owner_age - int(pen.get('start_age', 65)))
-                return pen_survivor_mo * 12 * (1 + float(pen.get('cola', 0))) ** yrs_collecting
+                yrs_collecting = max(0, owner_age - int(_num(pen.get('start_age'), 65)))
+                return pen_survivor_mo * 12 * (1 + _num(pen.get('cola'), 0)) ** yrs_collecting
             elif survivor_active and not owner_alive:
                 return 0.0
             else:
@@ -694,26 +824,54 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
 
         # ── Working income ────────────────────────────────────────────────────
         yrs_elapsed = yr - curr_yr
-        p1_work = p1_gross_income * (1 + inflation) ** yrs_elapsed if (not p1_ret and p1_alive) else 0.0
-        p2_work = p2_gross_income * (1 + inflation) ** yrs_elapsed if (not p2_ret and p2_alive) else 0.0
+        p1_work = p1_gross_income * (1 + inflation) ** yrs_elapsed if (p1_working and p1_alive) else 0.0
+        p2_work = p2_gross_income * (1 + inflation) ** yrs_elapsed if (p2_working and p2_alive) else 0.0
         working_income = p1_work + p2_work
-        total_fica = fica_tax(p1_work, yrs_elapsed) + fica_tax(p2_work, yrs_elapsed)
+        total_fica = fica_tax(p1_work, yrs_since_2024) + fica_tax(p2_work, yrs_since_2024)
 
-        guaranteed = pen1_inc + pen2_inc + total_ss + working_income
-
-        # Contributions for still-working spouse
+        # ── Contributions for a still-working spouse ─────────────────────────
+        # Contributions are funded OUT OF salary, so they are computed first,
+        # capped at earned income (you cannot contribute what you did not
+        # earn), and then subtracted from the cash available to spend.
+        # Contributions to traditional accounts are pre-tax and also reduce
+        # taxable income. Previously the salary was both fully spendable and
+        # fully contributed, which created money out of nothing.
+        contrib_total   = 0.0
+        contrib_pretax  = 0.0
+        planned = []
         if not both_ret:
             for k, v in acct_defs.items():
-                owner = v.get('owner', 'p1')
-                if (owner == 'p1' and not p1_ret) or (owner == 'p2' and not p2_ret):
+                owner = v['owner']
+                if (owner == 'p1' and p1_working) or (owner == 'p2' and p2_working):
                     owner_age = p1a if owner == 'p1' else p2a
-                    c = float(contribs.get(k, 0))
+                    c = _num(contribs.get(k, 0))
                     if owner_age >= 50:
                         if owner_age >= 60 and owner_age <= 63:
-                            c += float(super_cups.get(k, catch_ups.get(k, 0)))
+                            c += _num(super_cups.get(k, catch_ups.get(k, 0)))
                         else:
-                            c += float(catch_ups.get(k, 0))
-                    bal[k] = max(0.0, bal[k] + c)
+                            c += _num(catch_ups.get(k, 0))
+                    if c > 0:
+                        planned.append((k, v, c))
+                        contrib_total += c
+
+        if contrib_total > 0:
+            # Cannot contribute more than the household earned this year.
+            scale = min(1.0, working_income / contrib_total) if working_income > 0 else 0.0
+            contrib_total = 0.0
+            for k, v, c in planned:
+                c *= scale
+                if c <= 0:
+                    continue
+                bal[k] = max(0.0, bal[k] + c)
+                if v['type'] in ('taxable', 'savings'):
+                    basis[k] += c      # already-taxed money — adds to basis
+                if v['type'] == 'traditional':
+                    contrib_pretax += c
+                contrib_total += c
+
+        # Salary left over after funding the contributions is what can be spent.
+        guaranteed = pen1_inc + pen2_inc + total_ss + max(0.0, working_income - contrib_total)
+        taxable_wages = max(0.0, working_income - contrib_pretax)
 
         # ── RMDs ─────────────────────────────────────────────────────────────
         rmds = {}
@@ -783,24 +941,20 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                     w[k] += take; bal[k] = max(0, bal[k] - take)
                     need = max(0.0, need - take)
 
-            # 2. Taxable accounts — track capital gains
-            taxable_gains    = 0.0
-            savings_interest = 0.0
+            # 2. Taxable accounts — track capital gains.
+            #    Savings/HYSA basis tracks its balance (interest is taxed as
+            #    earned, below), so only brokerage realizes a gain here.
+            taxable_gains = 0.0
             for k, v in acct_defs.items():
                 if v['type'] in ('savings', 'taxable') and need > 0 and bal[k] > 0:
                     take = min(bal[k], need)
-                    if bal[k] > 0:
-                        gain_pct = max(0.0, (bal[k] - basis[k]) / bal[k])
-                    else:
-                        gain_pct = 0.0
+                    gain_pct   = max(0.0, (bal[k] - basis[k]) / bal[k])
                     gain       = take * gain_pct
                     basis_used = take - gain
                     basis[k]   = max(0.0, basis[k] - basis_used)
 
                     if v['type'] == 'taxable':
                         taxable_gains += gain
-                    else:
-                        savings_interest += gain
 
                     w[k] += take; bal[k] -= take; need -= take
 
@@ -816,23 +970,37 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                     take = min(bal[k], need)
                     w[k] += take; bal[k] -= take; need -= take
 
+            # Savings/HYSA interest is taxable in the year it is earned, even if
+            # never withdrawn. Computed on the post-withdrawal balance; the
+            # matching basis credit happens in the growth step below.
+            savings_interest = sum(
+                bal[k] * acct_defs[k]['ret_growth']
+                for k in bal if acct_defs[k]['type'] == 'savings'
+            )
+
             # ── Tax on this iteration's withdrawals ─────────────────────────
             trad_w       = sum(w[k] for k, v in acct_defs.items() if v['type'] == 'traditional')
-            # Federal: all pension income is ordinary income regardless of NYS exemption
-            # Working income is earned income — taxed at regular rates
-            fed_ordinary = pen1_inc + pen2_inc + trad_w + savings_interest + working_income
-            tx_ss        = taxable_ss_portion(total_ss, fed_ordinary, use_single)
+            # Federal: all pension income is ordinary income regardless of the
+            # state exemption. Wages are net of pre-tax 401(k) contributions.
+            fed_ordinary = pen1_inc + pen2_inc + trad_w + savings_interest + taxable_wages
+            # Provisional income for the SS calculation includes capital gains.
+            tx_ss        = taxable_ss_portion(total_ss, fed_ordinary + taxable_gains, use_single)
             fed_ordinary += tx_ss
 
             fed_ltcg_tax = calc_ltcg_tax(taxable_gains, fed_ordinary,
                                          ltcg_brackets, fd, tax_inf, yrs_since_2024)
             fed_income   = fed_ordinary
-            # State tax: exclude pensions marked state-exempt; apply pension exclusion
-            # to remaining pension income + other ordinary income.
+            # Capital gains stack on top of ordinary income for bracket
+            # purposes (used later for Roth conversion headroom).
+            fed_stack    = fed_ordinary + taxable_gains
+            # State tax: exclude pensions marked state-exempt; the pension/IRA
+            # exclusion applies only to pension and tax-deferred withdrawals —
+            # not to wages, interest or capital gains.
             st_ss        = total_ss * st_ss_taxable_pct  # most states don't tax SS
             st_pen_inc   = sum(inc for pen, inc in pen_details if not pen.get('nys_exempt', False))
+            st_excl_used = min(state_excl, st_pen_inc + trad_w)
             st_taxable   = max(0.0, st_pen_inc + trad_w + savings_interest
-                               + taxable_gains + working_income + st_ss - state_excl)
+                               + taxable_gains + taxable_wages + st_ss - st_excl_used)
 
             fed_tax   = calc_tax(fed_income, fb, fd) + fed_ltcg_tax
             state_tax = calc_tax(st_taxable, nb, nd)
@@ -845,6 +1013,10 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
 
             if deficit <= 50:    # close enough (within $50)
                 break
+            if sum(bal.values()) <= 0.01:
+                # Portfolio is exhausted — grossing up further cannot raise
+                # another dollar, and would inflate the reported shortfall.
+                break
             # Gross up by deficit / (1 - combined_marginal) so the extra
             # withdrawal covers its own federal + state tax in one shot.
             fed_marginal   = marginal_rate_at(fed_income, fb, fd)
@@ -853,39 +1025,107 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             gross_up = deficit / max(0.30, 1.0 - combined) if combined < 0.95 else deficit
             extra_for_tax = max(0.0, extra_for_tax + gross_up)
 
-        shortfall = max(0.0, need)  # > 0 means ran out of money this year
+        # Unfunded after-tax spending. Measured against what was actually
+        # raised, so an exhausted portfolio reports the true gap rather than
+        # the gross-up loop's inflated target.
+        shortfall = max(0.0, exp - (guaranteed + sum(w.values()) - total_tax))
 
         # ── ROTH CONVERSIONS ─────────────────────────────────────────────────
         roth_conv = 0.0
         roth_conv_tax = 0.0
+        roth_conv_note = None
 
         roth_strategy = str(profile.get('roth_strategy', 'fill_22'))  # fixed, fill_12, fill_22, fill_24, fill_32, none
-        roth_fixed_amt = float(profile.get('roth_fixed_amount', 20000))
+        roth_fixed_amt = _num(profile.get('roth_fixed_amount'), 20000)
         ROTH_BRACKET_MAP = {'fill_12': 0.12, 'fill_22': 0.22, 'fill_24': 0.24, 'fill_32': 0.32}
 
         if do_roth and both_ret and roth_strategy != 'none':
-            trad_bal_total = sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'traditional')
-            if trad_bal_total > 5000:
+            trad_keys = [k for k, v in acct_defs.items() if v['type'] == 'traditional']
+            roth_keys = [k for k, v in acct_defs.items() if v['type'] == 'roth']
+            trad_bal_total = sum(bal[k] for k in trad_keys)
+            if not roth_keys:
+                # Without a destination account the conversion has nowhere to
+                # land. Previously the traditional balance was debited anyway
+                # and the money simply vanished.
+                if trad_bal_total > 5000:
+                    roth_conv_note = 'no_roth_account'
+            elif trad_bal_total > 5000:
                 if roth_strategy == 'fixed':
                     room = roth_fixed_amt
                 else:
                     target_rate = ROTH_BRACKET_MAP.get(roth_strategy, 0.22)
-                    room = bracket_room(fed_income, target_rate, fb, fd)
+                    # Gains stack on top of ordinary income, so headroom is
+                    # measured against the full stack.
+                    room = bracket_room(fed_stack, target_rate, fb, fd)
                 if room > 0:
                     roth_conv = min(room, trad_bal_total, 250000)
-                    roth_conv_tax = calc_tax(fed_income + roth_conv, fb, fd) - calc_tax(fed_income, fb, fd)
-                    # Move from traditional → Roth
-                    rem_conv = roth_conv
-                    roth_keys = [k for k, v in acct_defs.items() if v['type'] == 'roth']
-                    for k, v in acct_defs.items():
-                        if v['type'] == 'traditional' and rem_conv > 0:
+
+                    def _conv_tax(amount):
+                        """Federal + state tax generated by converting `amount`."""
+                        f = calc_tax(fed_income + amount, fb, fd) - calc_tax(fed_income, fb, fd)
+                        s = calc_tax(st_taxable + amount, nb, nd) - calc_tax(st_taxable, nb, nd)
+                        return f + s
+
+                    # The conversion tax has to be paid with real money. Cash
+                    # from taxable/savings accounts is used first (the optimal
+                    # approach, since it leaves the whole conversion compounding
+                    # tax-free); any remainder is withheld from the conversion
+                    # itself. Previously the tax was reported but never funded,
+                    # which made every conversion look free.
+                    cash_keys = [k for k, v in acct_defs.items()
+                                 if v['type'] in ('taxable', 'savings')]
+                    cash_avail = sum(bal[k] for k in cash_keys)
+
+                    roth_conv_tax = _conv_tax(roth_conv)
+                    paid_from_cash = min(roth_conv_tax, cash_avail)
+                    withheld = roth_conv_tax - paid_from_cash
+                    if withheld > roth_conv:
+                        # Cannot even withhold enough — scale the conversion
+                        # back to what the household can actually pay for.
+                        lo_c, hi_c = 0.0, roth_conv
+                        for _ in range(30):
+                            mid_c = (lo_c + hi_c) / 2.0
+                            if _conv_tax(mid_c) <= cash_avail + mid_c:
+                                lo_c = mid_c
+                            else:
+                                hi_c = mid_c
+                        roth_conv = lo_c
+                        roth_conv_tax = _conv_tax(roth_conv)
+                        paid_from_cash = min(roth_conv_tax, cash_avail)
+                        withheld = max(0.0, roth_conv_tax - paid_from_cash)
+
+                    if roth_conv > 0:
+                        # Debit the gross conversion from traditional accounts.
+                        rem_conv = roth_conv
+                        for k in trad_keys:
+                            if rem_conv <= 0:
+                                break
                             take = min(bal[k], rem_conv)
                             bal[k] -= take
-                            if roth_keys:
-                                bal[roth_keys[0]] += take
                             rem_conv -= take
-                    fed_income += roth_conv
-                    st_taxable = max(0.0, st_taxable + roth_conv)
+                        # Only the net (after any withholding) reaches the Roth.
+                        bal[roth_keys[0]] += max(0.0, roth_conv - withheld)
+
+                        # Sell taxable/savings assets to cover the cash portion.
+                        rem_cash = paid_from_cash
+                        for k in cash_keys:
+                            if rem_cash <= 0:
+                                break
+                            take = min(bal[k], rem_cash)
+                            if take <= 0:
+                                continue
+                            if bal[k] > 0:
+                                gain_pct = max(0.0, (bal[k] - basis[k]) / bal[k])
+                                basis[k] = max(0.0, basis[k] - take * (1 - gain_pct))
+                            bal[k] -= take
+                            rem_cash -= take
+
+                        fed_income += roth_conv
+                        fed_stack  += roth_conv
+                        st_taxable  = max(0.0, st_taxable + roth_conv)
+                    else:
+                        roth_conv_tax = 0.0
+                        roth_conv_note = 'unaffordable'
 
         # Pre-Roth tax = the amount the gross-up loop was designed to cover.
         # Roth conversion tax is a strategic cost, not a spending cost, so
@@ -896,7 +1136,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         if roth_conv > 0:
             fed_tax   = calc_tax(fed_income, fb, fd) + fed_ltcg_tax
             state_tax = calc_tax(st_taxable, nb, nd)
-            total_tax = fed_tax + state_tax
+            total_tax = fed_tax + state_tax + total_fica
 
         # ── REINVEST SURPLUS (RMD excess beyond spending needs) ──────────────
         # When forced distributions (RMDs) + guaranteed income exceed
@@ -921,22 +1161,30 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 basis[reinvest_key] += surplus   # already taxed — all basis
 
         # ── GROW ACCOUNTS ────────────────────────────────────────────────────
+        # The glide path describes the invested portfolio's stock/bond mix, so
+        # it deliberately does NOT override a cash savings/HYSA rate.
         eq_pct = None
-        for k, v in acct_defs.items():
-            base_gr = float(v.get('ret_growth', float(v.get('growth_rate', 0.07)) * 0.85))
-            if glide_on and any_ret:
-                # Blend between equity and bond returns based on p1 age
-                if p1a <= glide_age_start:
-                    eq_pct = glide_eq_start
-                elif p1a >= glide_age_end:
-                    eq_pct = glide_eq_end
-                else:
-                    t = (p1a - glide_age_start) / max(1, glide_age_end - glide_age_start)
-                    eq_pct = glide_eq_start + t * (glide_eq_end - glide_eq_start)
-                gr = eq_pct * glide_stock_ret + (1 - eq_pct) * glide_bond_ret
+        if glide_on and any_ret:
+            if p1a <= glide_age_start:
+                eq_pct = glide_eq_start
+            elif p1a >= glide_age_end:
+                eq_pct = glide_eq_end
             else:
-                gr = base_gr
-            bal[k] = max(0.0, bal[k] * (1 + gr))
+                t = (p1a - glide_age_start) / max(1, glide_age_end - glide_age_start)
+                eq_pct = glide_eq_start + t * (glide_eq_end - glide_eq_start)
+            glide_gr = eq_pct * glide_stock_ret + (1 - eq_pct) * glide_bond_ret
+
+        for k, v in acct_defs.items():
+            if eq_pct is not None and v['type'] != 'savings':
+                gr = glide_gr
+            else:
+                gr = v['ret_growth']
+            growth = bal[k] * gr
+            bal[k] = max(0.0, bal[k] + growth)
+            if v['type'] == 'savings':
+                # Interest was taxed as ordinary income this year, so it is
+                # basis — a later withdrawal must not tax it again.
+                basis[k] = min(bal[k], basis[k] + max(0.0, growth))
 
         total_bal = sum(bal.values())
 
@@ -955,14 +1203,18 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             'ss_p2': round(ss2_ann),
             'total_ss': round(total_ss),
             'working_income': round(working_income),
+            'contributions_total': round(contrib_total),
             'fica_tax': round(total_fica),
             'shock_expense': round(shock_amt),
             'survivor_active': survivor_active,
+            'p1_alive': p1_alive,
+            'p2_alive': p2_alive,
             'guaranteed_income': round(guaranteed),
             'withdrawal_total': round(sum(w.values())),
             'withdrawals': {k: round(v) for k, v in w.items()},
             'roth_conversion': round(roth_conv),
             'roth_conversion_tax': round(roth_conv_tax),
+            'roth_conversion_note': roth_conv_note,
             'federal_tax': round(fed_tax),
             'federal_ltcg_tax': round(fed_ltcg_tax),
             'capital_gains': round(taxable_gains),
@@ -976,9 +1228,12 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             'taxable_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] in ['taxable', 'savings'])),
             'rmd_total': round(rmd_tot),
             'surplus_reinvested': round(surplus),
-            'glide_equity_pct': round(eq_pct * 100, 1) if (glide_on and any_ret) else None,
+            'glide_equity_pct': round(eq_pct * 100, 1) if eq_pct is not None else None,
             'account_balances': {k: round(v) for k, v in bal.items()},
         })
+
+        # Record this year's MAGI for the IRMAA 2-year lookback.
+        magi_by_year[yr] = fed_stack
 
     return results
 
@@ -1003,7 +1258,13 @@ def _run_ss_scenario(profile, a1, a2):
         'total_lifetime_tax': round(total_tax),
         'final_balance':     round(final_bal),
         'shortfall_years':   shortfall_yrs,
-        'score':             total_ss + final_bal - total_tax,
+        # Score = ending portfolio value. Expenses are identical across
+        # scenarios, so the terminal balance already captures the whole effect
+        # of the claiming decision: more Social Security means smaller
+        # withdrawals, and taxes are paid out of the portfolio along the way.
+        # (The old score added lifetime SS to the ending balance and so
+        # counted every benefit dollar twice, biasing the recommendation.)
+        'score':             round(final_bal),
     }
 
 
@@ -1040,7 +1301,8 @@ def optimize_ss(profile):
         return {'comparisons': [], 'recommended': None,
                 'individual_p1': [], 'individual_p2': []}
 
-    best = max(comparisons, key=lambda x: x['score'])
+    # Avoiding a year where the money runs out beats any ending balance.
+    best = max(comparisons, key=lambda x: (-x['shortfall_years'], x['score']))
     best_a1 = best['ss1_age']
     best_a2 = best['ss2_age']
 
@@ -1237,37 +1499,39 @@ def calc_nys_pension(params):
     """
     Calculate NYS ERS or PFRS pension benefit from service record.
 
-    ERS Tier formulas (NYSERS):
+    ERS Tier formulas (NYSLRS):
       Tier 3/4  (1976–2009): FAS = avg 3 highest consec. yrs
-                              <20 yrs → 1.75% × FAS × service
-                              ≥20 yrs → 2.00% × FAS × service (all years)
-                              NRA 62; early reduction 6⅔%/yr before 62 unless 30+ yrs
+                              <20 yrs  → 1.66% × FAS × service
+                              20–30 yrs → 2.00% × FAS × service (all years)
+                              >30 yrs  → 2.00% × FAS × 30 + 1.50% × FAS × (service-30)
+                              NRA 62; early reduction per the NYSLRS table
+                              unless 30+ yrs of service
       Tier 5    (2010–2012): FAS = avg 3 highest consec. yrs
-                              2.00% × FAS × service (all years)
-                              NRA 62; same early reduction rules
+                              same graded percentages as Tier 3/4
+                              NRA 62; no 30-year exemption from the reduction
       Tier 6    (2012–now):  FAS = avg 5 highest consec. yrs
-                              ≤20 yrs: 1.75% × FAS × service
-                              21–30 yrs: +2.00% per yr over 20
-                              31+ yrs:  +1.50% per yr over 30
-                              NRA 63; early reduction 6⅔%/yr before 63 unless 30+ yrs
+                              <20 yrs → 1.66% × FAS × service
+                              20 yrs  → 1.75% × FAS × 20  (= 35% of FAS)
+                              >20 yrs → 35% of FAS + 2.00% per yr beyond 20
+                              NRA 63; no 30-year exemption from the reduction
 
     PFRS (Police & Fire):     2.00% × FAS × service, max 60% (30 yrs)
                               NRA = 20 years of service at any age
     """
     system      = params.get('system', 'ERS')
     tier        = str(params.get('tier', '6'))
-    cur_salary  = float(params.get('current_salary', 0))
-    cur_age     = float(params.get('current_age', 55))
-    cur_service = float(params.get('current_service_years', 0))
-    raise_rate  = float(params.get('annual_raise_pct', 2.0)) / 100.0
+    cur_salary  = _num(params.get('current_salary'), 0)
+    cur_age     = _num(params.get('current_age'), 55)
+    cur_service = _num(params.get('current_service_years'), 0)
+    raise_rate  = _num(params.get('annual_raise_pct'), 2.0) / 100.0
     fas_yrs     = 5 if tier == '6' else 3   # Tier 6 uses 5-year FAS
 
     # ── Two ages that can differ ──────────────────────────────────────────────
     # leave_age:   when employment ends → service years and FAS are FROZEN here
     # benefit_age: when payments begin  → determines early-retirement reduction
     #   (you can leave at 57, defer benefits to 62, and avoid the 33% penalty)
-    leave_age   = float(params.get('leave_employment_age', params.get('planned_retire_age', 65)))
-    benefit_age = float(params.get('benefit_start_age',   params.get('planned_retire_age', leave_age)))
+    leave_age   = _num(params.get('leave_employment_age') or params.get('planned_retire_age'), 65)
+    benefit_age = _num(params.get('benefit_start_age') or params.get('planned_retire_age'), leave_age)
     benefit_age = max(benefit_age, leave_age)   # can't collect before leaving
 
     def project_fas_and_service(leave_at_age):
@@ -1293,10 +1557,18 @@ def calc_nys_pension(params):
             gross = fas * min(service * 0.02, 0.60)
             return gross, gross / 12, 0.0, gross, 'PFRS'
 
+        def ers_graded(fas_, service_):
+            """Tier 3/4/5 service-fraction: 1.66% under 20 years, 2% for
+            20-30 years (applied to all years), 1.5% for years beyond 30."""
+            if service_ < 20:
+                return fas_ * 0.0166 * service_
+            if service_ <= 30:
+                return fas_ * 0.02 * service_
+            return fas_ * 0.02 * 30 + fas_ * 0.015 * (service_ - 30)
+
         if tier in ('3', '4'):
-            factor = 0.02 if service >= 20 else 0.0175
-            gross  = fas * factor * service
-            nra    = 62
+            gross = ers_graded(fas, service)
+            nra   = 62
             # Tier 2/3/4: 30+ years of service => no early-retirement reduction
             if benefit_start_age < nra and service < 30:
                 reduction = nyslrs_reduction(benefit_start_age, 'tier34', nra)
@@ -1306,7 +1578,7 @@ def calc_nys_pension(params):
             return annual, annual / 12, reduction, gross, f'Tier {tier} ERS'
 
         elif tier == '5':
-            gross = fas * 0.02 * service
+            gross = ers_graded(fas, service)
             nra   = 62
             # Tier 5 ERS: the 30-year exemption does NOT apply (NYSLRS)
             reduction = nyslrs_reduction(benefit_start_age, 'tier5', nra)
@@ -1314,12 +1586,12 @@ def calc_nys_pension(params):
             return annual, annual / 12, reduction, gross, 'Tier 5 ERS'
 
         elif tier == '6':
-            if service <= 20:
-                gross = fas * 0.0175 * service
-            elif service <= 30:
-                gross = fas * 0.0175 * 20 + fas * 0.02 * (service - 20)
+            # 1.66% under 20 years; exactly 20 years earns 35% of FAS; every
+            # year beyond 20 adds 2%. Tier 6 has no reduced rate past 30.
+            if service < 20:
+                gross = fas * 0.0166 * service
             else:
-                gross = fas * 0.0175 * 20 + fas * 0.02 * 10 + fas * 0.015 * (service - 30)
+                gross = fas * 0.35 + fas * 0.02 * (service - 20)
             nra = 63
             # Tier 6 ERS: the 30-year exemption does NOT apply (NYSLRS)
             reduction = nyslrs_reduction(benefit_start_age, 'tier6', nra)
@@ -1327,7 +1599,7 @@ def calc_nys_pension(params):
             return annual, annual / 12, reduction, gross, 'Tier 6 ERS'
 
         else:
-            gross = fas * 0.02 * service
+            gross = ers_graded(fas, service)
             return gross, gross / 12, 0.0, gross, f'Tier {tier}'
 
     # ── Primary result: FAS/service frozen at leave_age, reduction at benefit_age ──
@@ -1337,7 +1609,9 @@ def calc_nys_pension(params):
     # ── Comparison: hold leave_age fixed, vary benefit_start_age ─────────────
     # This reveals the value of deferring collection to reduce or eliminate penalty.
     comparison = []
-    test_benefit_ages = sorted({55, 57, 60, 62, 63, 65, 67, int(leave_age), int(benefit_age)})
+    # Keep the exact leave/benefit ages (they may be fractional) so the
+    # planned scenario always appears in the comparison table.
+    test_benefit_ages = sorted({55, 57, 60, 62, 63, 65, 67} | {leave_age, benefit_age})
     for tba in test_benefit_ages:
         if tba < leave_age:      # can't collect before leaving
             continue
@@ -1467,7 +1741,44 @@ DEFAULT_PROFILE = {
 }
 
 
+# ─── PROFILE VALIDATION ──────────────────────────────────────────────────────
+
+def validate_profile(data):
+    """Sanity-check a profile before it is written to disk.
+
+    Not a full schema — just enough that a malformed payload cannot replace a
+    good profile.json and then break every subsequent calculation.
+    Returns (ok, reason).
+    """
+    if not isinstance(data, dict):
+        return False, 'not an object'
+    for key in ('person1', 'person2'):
+        if key in data and not isinstance(data[key], dict):
+            return False, f'{key} must be an object'
+    accounts = data.get('accounts')
+    if accounts is not None:
+        if not isinstance(accounts, dict):
+            return False, 'accounts must be an object'
+        for k, v in accounts.items():
+            if not isinstance(v, dict):
+                return False, f'account {k} must be an object'
+            t = str(v.get('type', 'taxable')).lower()
+            if t not in ACCOUNT_TYPES:
+                return False, f'account {k} has unknown type {t!r}'
+    if 'pensions' in data and not isinstance(data['pensions'], list):
+        return False, 'pensions must be a list'
+    # Must survive an actual projection, or it is not a usable profile.
+    try:
+        project(copy.deepcopy(data))
+    except Exception as e:
+        return False, f'projection failed ({type(e).__name__})'
+    return True, ''
+
+
 # ─── HTTP SERVER ─────────────────────────────────────────────────────────────
+
+ALLOWED_HOSTS = ('localhost', '127.0.0.1', '::1')
+
 
 class Handler(BaseHTTPRequestHandler):
     MAX_BODY = 5 * 1024 * 1024  # 5 MB request cap (DoS guard)
@@ -1477,8 +1788,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def _host_ok(self):
         # Anti DNS-rebinding: only honor requests addressed to localhost.
-        hostname = self.headers.get('Host', '').split(':')[0]
-        return hostname in ('localhost', '127.0.0.1', '::1', '')
+        # A missing Host is rejected too — HTTP/1.1 requires it, and allowing
+        # it left an easy bypass for the check.
+        host = self.headers.get('Host')
+        if not host:
+            return False
+        return host.rsplit(':', 1)[0].strip('[]') in ALLOWED_HOSTS
+
+    def _origin_ok(self):
+        """Reject cross-site writes (CSRF).
+
+        Dropping the wildcard CORS header stops another site *reading* the
+        profile, but an HTML form POST is a 'simple request' that needs no
+        preflight — so a malicious page could still overwrite profile.json.
+        Requiring a same-origin Origin/Sec-Fetch-Site and a JSON content type
+        (which forms cannot send) closes that hole.
+        """
+        site = self.headers.get('Sec-Fetch-Site')
+        if site is not None and site not in ('same-origin', 'none'):
+            return False
+
+        origin = self.headers.get('Origin')
+        if origin:
+            allowed = set()
+            for h in ALLOWED_HOSTS:
+                hh = f'[{h}]' if ':' in h else h
+                allowed.add(f'http://{hh}:{PORT}')
+            if origin not in allowed:
+                return False
+
+        ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        return ctype == 'application/json'
+
+    def _fail(self, message, status=500):
+        """Log the real traceback locally; tell the client only what it needs."""
+        traceback.print_exc(file=sys.stderr)
+        self.send_json({'error': message}, status)
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -1511,13 +1856,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403); self.end_headers(); return
         if self.path in ('/', '/index.html'):
             self.send_file(os.path.join(CURRENT_DIR, 'index.html'), 'text/html; charset=utf-8')
+        elif self.path == '/api/version':
+            self.send_json({'version': APP_VERSION})
         elif self.path == '/api/profile':
-            with DATA_LOCK:
-                if os.path.exists(DATA_FILE):
-                    with open(DATA_FILE) as f:
-                        profile = json.load(f)
-                else:
-                    profile = DEFAULT_PROFILE
+            try:
+                with DATA_LOCK:
+                    if os.path.exists(DATA_FILE):
+                        with open(DATA_FILE) as f:
+                            profile = json.load(f)
+                    else:
+                        profile = DEFAULT_PROFILE
+            except Exception:
+                self._fail('Could not read profile.json'); return
             self.send_json(profile)
         else:
             self.send_response(404); self.end_headers()
@@ -1525,6 +1875,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._host_ok():
             self.send_response(403); self.end_headers(); return
+        if not self._origin_ok():
+            self.send_json({'error': 'Cross-site request refused'}, 403); return
         try:
             length = int(self.headers.get('Content-Length', 0))
         except (TypeError, ValueError):
@@ -1536,8 +1888,13 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(body)
         except Exception:
             self.send_json({'error': 'Invalid JSON'}, 400); return
+        if not isinstance(data, dict):
+            self.send_json({'error': 'Expected a JSON object'}, 400); return
 
         if self.path == '/api/save':
+            ok, why = validate_profile(data)
+            if not ok:
+                self.send_json({'error': f'Invalid profile: {why}'}, 400); return
             try:
                 with DATA_LOCK:
                     tmp = DATA_FILE + '.tmp'
@@ -1545,69 +1902,64 @@ class Handler(BaseHTTPRequestHandler):
                         json.dump(data, f, indent=2)
                     os.replace(tmp, DATA_FILE)
                 self.send_json({'ok': True})
-            except Exception as e:
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Could not save profile')
 
         elif self.path == '/api/calculate':
             try:
                 results = project(data)
                 self.send_json({'ok': True, 'results': results})
-            except Exception as e:
-                import traceback
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Projection failed')
 
         elif self.path == '/api/calculate_no_roth':
             try:
                 results = project(data, do_roth=False)
                 self.send_json({'ok': True, 'results': results})
-            except Exception as e:
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Projection failed')
 
         elif self.path == '/api/optimize_ss':
             try:
                 result = optimize_ss(data)
                 self.send_json({'ok': True, **result})
-            except Exception as e:
-                import traceback
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Social Security optimization failed')
 
         elif self.path == '/api/calc_nys_pension':
             try:
                 result = calc_nys_pension(data)
                 self.send_json(result)
-            except Exception as e:
-                import traceback
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Pension calculation failed')
 
         elif self.path == '/api/recommend':
             try:
-                target_wealth = float(data.get('target_wealth', 0))
+                target_wealth = _num(data.get('target_wealth'), 0)
                 target_age    = data.get('target_age', None)
                 if target_age is not None:
-                    target_age = int(target_age)
+                    target_age = int(_num(target_age, 95))
                 profile_data  = data.get('profile', data)
                 result = recommend_spending(profile_data, target_wealth=target_wealth, target_age=target_age)
                 self.send_json({'ok': True, **result})
-            except Exception as e:
-                import traceback
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Spending recommendation failed')
 
         elif self.path == '/api/monte_carlo':
             try:
-                n_sims     = max(100, min(2000, int(data.get('n_sims', 500))))
-                vol        = max(0.0, min(0.40, float(data.get('volatility', 0.12))))
-                gr_cut     = max(0.0, min(0.30, float(data.get('gr_cut',   0.10))))
-                gr_boost   = max(0.0, min(0.30, float(data.get('gr_boost', 0.10))))
-                gr_floor   = max(0.50, min(1.00, float(data.get('gr_floor', 0.85))))
-                gr_ceil    = max(1.00, min(2.00, float(data.get('gr_ceil',  1.25))))
+                n_sims     = max(100, min(2000, int(_num(data.get('n_sims'), 500))))
+                vol        = max(0.0, min(0.40, _num(data.get('volatility'), 0.12)))
+                gr_cut     = max(0.0, min(0.30, _num(data.get('gr_cut'),   0.10)))
+                gr_boost   = max(0.0, min(0.30, _num(data.get('gr_boost'), 0.10)))
+                gr_floor   = max(0.50, min(1.00, _num(data.get('gr_floor'), 0.85)))
+                gr_ceil    = max(1.00, min(2.00, _num(data.get('gr_ceil'),  1.25)))
                 result     = monte_carlo(data, n_sims=n_sims, volatility=vol,
                                          guardrails=True, gr_cut=gr_cut,
                                          gr_boost=gr_boost, gr_floor=gr_floor,
                                          gr_ceil=gr_ceil)
                 self.send_json(result)
-            except Exception as e:
-                import traceback
-                self.send_json({'error': str(e)}, 500)
+            except Exception:
+                self._fail('Monte Carlo simulation failed')
 
         else:
             self.send_response(404); self.end_headers()
@@ -1624,12 +1976,10 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
     """
     n_sims   = len(all_shocks)
     n_years  = len(withdrawals)
-    _first_w = next((w for w in withdrawals if w > 0), 0.0)
-    initial_wr = _first_w / start_bal if start_bal > 0 else 0
 
     all_balances   = []
     depletion_ages = []
-    trigger_years  = 0       # total sim-years a guardrail fired
+    trigger_years  = 0       # total sim-years a guardrail actually moved spending
     total_adj      = 0.0     # cumulative adjustment factor (for avg)
 
     for shocks in all_shocks:
@@ -1637,31 +1987,39 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
         sim_bals    = []
         depleted_at = None
         adj_mult    = 1.0    # running guardrail multiplier
+        # Anchor the initial withdrawal rate on the balance in the first year
+        # money is actually drawn, which may be years into retirement.
+        initial_wr  = None
 
         for i in range(n_years):
             base_w = withdrawals[i]
 
-            if guardrails and bal > 0 and initial_wr > 0:
+            if initial_wr is None and base_w > 0 and bal > 0:
+                initial_wr = base_w / bal
+
+            if guardrails and bal > 0 and initial_wr:
                 # Current withdrawal rate vs initial rate
                 current_wr  = (base_w * adj_mult) / bal
                 rate_ratio  = current_wr / initial_wr
+                prev_mult   = adj_mult
 
                 if rate_ratio > gr_upper:
                     # Portfolio stressed — cut spending
-                    new_mult = adj_mult * (1.0 - gr_cut)
-                    adj_mult = max(new_mult, gr_floor)
-                    trigger_years += 1
+                    adj_mult = max(adj_mult * (1.0 - gr_cut), gr_floor)
                 elif rate_ratio < gr_lower:
                     # Portfolio thriving — allow more spending
-                    new_mult = adj_mult * (1.0 + gr_boost)
-                    adj_mult = min(new_mult, gr_ceil)
+                    adj_mult = min(adj_mult * (1.0 + gr_boost), gr_ceil)
+                # Only count a trigger when it changed spending; already being
+                # pinned at the floor or ceiling is not a fresh adjustment.
+                if adj_mult != prev_mult:
                     trigger_years += 1
 
             actual_w = base_w * adj_mult if guardrails else base_w
             total_adj += adj_mult
 
-            annual_return = drift + shocks[i]
-            bal = max(0.0, (bal - actual_w) * (1.0 + annual_return))
+            # Log-normal returns: `drift` is already a log-space mean, so it
+            # must be exponentiated rather than used as a simple return.
+            bal = max(0.0, (bal - actual_w) * math.exp(drift + shocks[i]))
             sim_bals.append(round(bal))
             if bal == 0 and depleted_at is None:
                 depleted_at = ages[i]
@@ -1731,18 +2089,18 @@ def monte_carlo(profile, n_sims=500, volatility=0.12,
     withdrawals = [float(r['withdrawal_total']) for r in ret_rows]
 
     # Weighted average base growth rate
-    accts     = profile.get('accounts', {})
-    total_val = sum(float(v.get('balance', 0)) for v in accts.values())
+    accts     = normalize_accounts(profile.get('accounts'))
+    total_val = sum(v['balance'] for v in accts.values())
     if total_val > 0:
         base_growth = sum(
-            float(v.get('ret_growth', float(v.get('growth_rate', 0.065)) * 0.85))
-            * float(v.get('balance', 0))
-            for v in accts.values()
+            v['ret_growth'] * v['balance'] for v in accts.values()
         ) / total_val
     else:
         base_growth = 0.065
 
-    drift = base_growth - (volatility ** 2) / 2.0  # geometric mean correction
+    # Log-space mean: exp(drift + shock) has an arithmetic mean of
+    # (1 + base_growth), so the simulated median compounds correctly.
+    drift = math.log(1.0 + max(-0.99, base_growth)) - (volatility ** 2) / 2.0
 
     # ── Generate shocks ONCE; reuse for both runs ─────────────────────────
     all_shocks = [

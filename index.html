@@ -167,6 +167,7 @@
 <div id="topbar">
   <h1>&#127968; Retirement Planner</h1>
   <span class="subtitle" id="topbar-subtitle">Retirement Planner</span>
+  <span class="subtitle" id="topbar-version"></span>
   <div class="ms-auto d-flex align-items-center gap-2">
     <button class="btn btn-sm btn-outline-light" onclick="exportProfile()" title="Export profile as JSON file">&#128229; Export</button>
     <button class="btn btn-sm btn-outline-light" onclick="triggerImport()" title="Import profile from JSON file">&#128228; Import</button>
@@ -695,7 +696,7 @@
   <div id="tab-ss" class="tab-pane">
     <h4 class="section-title">Social Security Optimizer</h4>
     <div class="insight-box info mb-3">
-      <strong>How this works:</strong> We model every combination of SS start ages for both of you and compare the long-term outcome. A higher score means more total wealth (lifetime SS + final portfolio − total taxes paid).
+      <strong>How this works:</strong> We model every combination of SS start ages for both of you and compare the long-term outcome. The score is your projected <em>ending portfolio balance</em> — because your spending is the same in every scenario, that single number already captures the whole effect of the decision: more Social Security means smaller withdrawals, and taxes are paid out of the portfolio along the way. Any combination that runs you out of money is ranked last regardless of its score.
     </div>
     <button class="btn btn-primary-custom mb-3" onclick="runOptimizeSSOnly()">&#128269; Run SS Optimization</button>
     <div id="no-data-ss" class="text-muted text-center py-3">Click "Run SS Optimization" to compare start ages.</div>
@@ -762,6 +763,7 @@
     <h4 class="section-title">Roth Conversion Planner</h4>
     <div id="no-data-roth" class="text-muted text-center py-5">Click <strong>Calculate Plan</strong> to see Roth conversion recommendations.</div>
     <div id="roth-content" style="display:none">
+      <div id="roth-note"></div>
       <div class="insight-box good mb-3">
         <strong>Roth Conversion Strategy:</strong>
         Choose how aggressively to convert traditional balances to Roth each year. "Fill the bracket" strategies convert just enough to reach the ceiling of a target bracket, avoiding unnecessary tax. Conversions reduce future RMDs and create tax-free growth, but cost tax today.
@@ -1969,6 +1971,17 @@ async function loadProfile() {
     renderProfile();
   } catch(e) { notify('Could not load profile', 'warning'); }
 }
+
+// APP_VERSION in app.py is the single source of truth for the version number.
+async function loadVersion() {
+  try {
+    const res = await fetch('/api/version');
+    const { version } = await res.json();
+    const el = document.getElementById('topbar-version');
+    if (el && version) el.textContent = `v${version}`;
+  } catch(e) { /* version display is cosmetic — ignore */ }
+}
+loadVersion();
 
 function renderProfile() {
   const p1 = profile.person1 || {};
@@ -3856,6 +3869,18 @@ function renderRothTab(results) {
 
   document.getElementById('no-data-roth').style.display = 'none';
   document.getElementById('roth-content').style.display = '';
+
+  // Explain why nothing was converted, rather than showing a silent zero.
+  const noteRow = retRows.find(r => r.roth_conversion_note);
+  const noteBox = document.getElementById('roth-note');
+  if (noteBox) {
+    const notes = {
+      no_roth_account: 'No conversions were modeled because this profile has no Roth account to convert into. Add a Roth account on the Profile tab to use this strategy.',
+      unaffordable: 'No conversions were modeled because there was not enough money outside your tax-deferred accounts to pay the conversion tax.'
+    };
+    const msg = noteRow ? notes[noteRow.roth_conversion_note] : null;
+    noteBox.innerHTML = msg ? `<div class="insight-box warning mb-3"><strong>Heads up:</strong> ${msg}</div>` : '';
+  }
 
   const totalConv = rothRows.reduce((s,r) => s+r.roth_conversion, 0);
   const totalConvTax = rothRows.reduce((s,r) => s+r.roth_conversion_tax, 0);

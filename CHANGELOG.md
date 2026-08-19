@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.2] - 2026-08-18
+
+### Fixed — Roth conversions
+- **Conversion tax was never paid.** The engine calculated the tax on a Roth conversion, reported it, and then never debited it from any account — so converting was free money and the optimizer always recommended converting as hard as possible. On a $2.2M test portfolio this overstated the ending balance by ~$2.0M. The tax is now funded from taxable/savings accounts where available, and withheld from the conversion itself otherwise; a conversion the household cannot pay for is scaled back.
+- **Conversions with no Roth account destroyed the portfolio.** The traditional balance was debited and, with no Roth account to receive it, the money simply vanished. In a test profile with the Roth rows deleted this drove the ending balance from $9.48M to $0. Conversions are now skipped when there is no destination account, and the Roth tab says why.
+- **Conversions never ran for single-person profiles.** A disabled person 2 was modeled as retiring in year 9999, so the "both retired" gate never opened and the Roth tab silently produced nothing.
+
+### Fixed — projection engine
+- **A working spouse's salary was counted twice.** Gross wages were fully available to fund expenses *and* fully contributed to accounts. Contributions are now funded out of salary, capped at earned income, and pre-tax (traditional) contributions correctly reduce taxable income.
+- **A disabled person 2 contributed forever.** Contributions to their accounts continued for the whole projection — $628k of phantom money by age 80 in a test case.
+- **Person 2's life expectancy was ignored.** It only sized the loop; the shorter-lived spouse kept collecting Social Security and incurring couple-level expenses to the end of the run. Each person now actually dies at their life expectancy, which switches the projection to survivor rules and single filing status.
+- **Taxable contributions during the retirement phase did not add to cost basis**, so every such dollar was later taxed as if it were pure capital gain.
+- **Capital gains were omitted from Social Security provisional income** (they are included per IRS) and from the bracket headroom used to size Roth conversions.
+- **Savings/HYSA interest was only taxed when withdrawn**, letting cash compound tax-deferred. Interest is now taxed in the year it is earned and credited to basis so it is not taxed twice.
+- **IRMAA was wrong in both directions.** Thresholds and premiums were frozen at 2024 nominal values while income inflated, so every projection drifted into the top tier; and the MAGI proxy counted only pensions and Social Security, missing the withdrawals, RMDs and conversions that actually trigger the surcharge. It now uses the real MAGI from two years prior — the SSA lookback — with indexed thresholds.
+- **The Social Security optimizer double-counted.** Its score added lifetime SS to the ending balance, but benefits already flow into that balance. The score is now the projected ending portfolio value, and any scenario that runs out of money ranks last.
+- **The NYS pension formulas were wrong.** NYSLRS credits 1.66% per year below 20 years of service (not 1.75%); Tiers 3/4/5 credit 1.5% for years past 30 (previously a flat 2%); Tier 6 has no reduced tier past 30 (previously 1.5%). The early-retirement reduction tables were already correct.
+- **RMDs stopped shrinking at age 95.** The Uniform Lifetime Table now runs to 120, so long life expectancies get the right divisor.
+- **Shortfalls were overstated** when the portfolio ran dry — the gross-up loop kept inflating its target against empty accounts. Shortfall is now the true unfunded after-tax spending gap.
+- **The asset-allocation glide path overrode every account**, including cash savings. It now applies only to invested accounts.
+- **The FICA wage base was two years stale**, indexed from the profile's current year rather than from its 2024 base.
+- **FICA silently vanished from `total_tax`** in any year with a Roth conversion.
+- **The state pension/IRA exclusion was applied against wages, interest and capital gains** instead of only pension and tax-deferred income. NY's exclusion also starts at 59½, not 60.
+- **Monte Carlo mixed log-space and simple returns** — the σ²/2 correction was subtracted from an arithmetic return and then applied as one, systematically understating growth. Returns are now properly log-normal. Guardrail triggers are also no longer counted in years where spending was already pinned at the floor or ceiling, and the initial withdrawal rate is anchored to the first year money is actually drawn.
+
+### Security
+- **Cross-site writes to `/api/save` (CSRF) are now blocked.** Removing the wildcard CORS header in 1.0.1 stopped other sites *reading* the profile, but an HTML form POST is a "simple request" that needs no preflight, so a malicious page could still overwrite or destroy `profile.json` while the app was running. POSTs now require a same-origin `Origin`/`Sec-Fetch-Site` and a JSON content type, which forms cannot send.
+- A missing `Host` header no longer bypasses the DNS-rebinding check.
+- `/api/save` validates the profile — including that it survives a projection — before replacing a good `profile.json` with a broken one.
+- Errors are logged with a full traceback to the server's stderr while the client still gets only a short message. Previously the traceback was discarded at both ends, making failures invisible.
+
+### Added
+- `APP_VERSION` in `app.py` is the single source of truth for the version, served at `/api/version` and shown in the topbar. (The 1.0.0 changelog claimed this; it had never actually been implemented.)
+- Malformed profile fields (strings like `"1,234"`, `null`, wrong types) are coerced or dropped instead of throwing.
+
+---
+
 ## [1.0.1] - 2026-08-14
 
 ### Security
