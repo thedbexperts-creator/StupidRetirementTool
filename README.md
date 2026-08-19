@@ -1,25 +1,54 @@
 # 🏠 Retirement Planner
 
-**Version 1.0.2**
+**Version 1.0.7**
 
-A free, offline retirement planning tool that runs locally on your computer. No accounts, no subscriptions, no data ever leaves your machine.
+A free, offline retirement planning tool that runs locally on your computer.
+No accounts, no subscriptions, no data ever leaves your machine.
 
-> ⚠️ **DISCLAIMER:** This software was written by a moron with no financial training who just watched a bunch of YouTube videos. It has been made available for testing purposes only. Anyone who would make real world decisions based on this tool is a bigger moron than the idiot who vibed it up. Use this tool at your own risk. No warranties. No promises. **This is not financial advice.**
+> ⚠️ **DISCLAIMER:** This is a planning model, not financial advice. It is
+> useful for comparing strategies against each other — claim early vs. late,
+> convert to Roth vs. don't, spend more vs. leave a legacy. It is not a
+> substitute for a CPA or a fee-only fiduciary planner, and it should not be the
+> only input to an irreversible decision.
+>
+> **Please read [ASSUMPTIONS.md](ASSUMPTIONS.md)** before trusting a number. It
+> documents exactly what is modelled and — more importantly — what is not.
 
 ---
 
 ## Features
 
-- **Income Projection** — Year-by-year retirement income and portfolio balance
-- **Withdrawal Plan** — Where your money comes from each year (which accounts get tapped and when)
-- **Social Security Optimizer** — Find the optimal claiming ages for one or two people
-- **Roth Conversion Optimizer** — Model conversion strategies to minimize lifetime taxes
-- **Tax Analysis** — Annual federal + state tax burden; supports all 50 states (no-tax, flat-rate, and progressive brackets) plus a custom rate option
-- **Monte Carlo Stress Test** — Run thousands of simulations to find your plan's success rate
-- **Scenario Comparison** — Save and compare multiple retirement plans side by side
-- **Spending Goals** — Binary-search engine that finds what you can safely spend to hit a target end balance
-- **NYS Sick Leave Calculator** — Models NYSHIP health insurance credit and §41-j pension service credit for NYS employees
-- **Flexible Accounts & Pensions** — Add or remove any number of investment accounts and pensions; each can be assigned to either person with individual tax-exempt flags and COLA settings
+- **Cash Flow Plan** — every dollar that moves in a given year, named and
+  grouped: *"Convert $211,228 from 401k (Person 1) → Roth IRA (Person 1)"*,
+  *"Sell $43,163 from Brokerage to pay the conversion tax"*. Money in minus
+  money out reconciles to that year's surplus or shortfall. Exports to CSV.
+- **Income Projection** — year-by-year income and portfolio balance, with an
+  **after-tax value** alongside the raw balance, because a dollar in a
+  traditional 401(k) is not a dollar.
+- **Social Security Optimizer** — every combination of claiming ages for one or
+  two people, scored on after-tax ending value.
+- **Roth Conversion Optimizer** — bracket-fill strategies that actually fund the
+  conversion tax and respect the ACA subsidy cliff, plus a **lifetime optimizer**
+  that searches how hard to convert *and when to stop*, ranked on after-tax value.
+- **Tax Analysis** — 2026 federal brackets, long-term capital gains, the 3.8%
+  Net Investment Income Tax, IRMAA surcharges, and income tax for **all 50
+  states**.
+- **ACA Premium Tax Credits** — post-2025 rules including the restored 400% FPL
+  subsidy cliff, and a guard that stops a Roth conversion from silently
+  destroying your subsidy.
+- **Monte Carlo Stress Test** — lognormal returns, optional dynamic-spending
+  guardrails, and optional inflation volatility.
+- **Scenario Comparison** — save and compare multiple plans side by side.
+- **Spending Goals** — binary-search engine that finds what you can safely spend
+  to hit a target end balance.
+- **Flexible Accounts** — traditional, Roth, taxable, savings, and **HSA**
+  (spent tax-free against medical costs, blocked after Medicare age).
+- **Part-Time Income** — phased-retirement earnings with an age window, taxed as
+  real earned income including FICA and ACA MAGI effects.
+- **Survivor Scenario** — models the death of a spouse, including the switch to
+  single-filer brackets.
+- **NYS Tools** — ERS Tier 3/4/5/6 pension calculator using the official NYSLRS
+  formulas and reduction tables, plus a sick-leave / NYSHIP credit calculator.
 
 ---
 
@@ -28,13 +57,14 @@ A free, offline retirement planning tool that runs locally on your computer. No 
 ### Option A — Python (recommended, works on Windows & Mac)
 
 **Windows:**
+
 1. Install Python from [python.org](https://www.python.org/downloads/) — check "Add Python to PATH"
 2. Double-click `Start RetirementPlanner.bat`
 
 **Mac:**
+
 1. Python 3 is usually pre-installed. If not: `brew install python`
-2. Double-click `Start RetirementPlanner.command`
-   *(First time: right-click → Open to bypass Gatekeeper)*
+2. Double-click `Start RetirementPlanner.command` *(First time: right-click → Open to bypass Gatekeeper)*
 
 Your browser opens automatically at `http://localhost:5000`
 
@@ -50,17 +80,40 @@ Your browser opens automatically at `http://localhost:5000`
 
 - All data is stored locally in `profile.json` next to the app
 - Nothing is sent to any server or external service
+- The local server only accepts requests from `localhost` and refuses
+  cross-site writes, so other websites in your browser cannot read or overwrite
+  your profile
 - Use **Export** to back up your profile or move it between computers
-- Use **Import** to restore a saved profile
+
+---
+
+## Development
+
+Run the test suite (no dependencies, ~0.5 seconds):
+
+```bash
+python3 test_app.py
+```
+
+73 tests pin published figures (SSA reduction percentages, NYSLRS reduction
+tables and benefit formulas, IRS 2026 brackets, ACA applicable percentages) and
+engine invariants (cash-flow reconciliation, conversion funding, optimizer
+scoring). They run automatically on push via GitHub Actions, which also boots
+the server, checks every endpoint, and asserts that cross-site writes are still
+refused.
 
 ---
 
 ## Files
 
 | File | Purpose |
-|------|---------|
-| `app.py` | Python backend — projection engine, tax calculations, Monte Carlo |
+| --- | --- |
+| `app.py` | Backend — projection engine, tax calculations, Monte Carlo |
 | `index.html` | Web UI — all tabs and charts |
+| `test_app.py` | Regression test suite |
+| `ASSUMPTIONS.md` | What is and is not modelled — **read this** |
+| `CHANGELOG.md` | Version history |
+| `.github/workflows/tests.yml` | CI — runs the suite on every push |
 | `Start RetirementPlanner.bat` | Windows launcher |
 | `Start RetirementPlanner.command` | Mac launcher |
 | `build_exe.bat` | Build a standalone Windows .exe |

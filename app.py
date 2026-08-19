@@ -8,7 +8,7 @@ Open: http://localhost:5000
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
-APP_VERSION = '1.0.6'
+APP_VERSION = '1.0.7'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.
@@ -735,6 +735,11 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
     annual_exp = _num(profile.get('annual_expenses'), 0)
 
     # ── After-tax valuation assumptions ──────────────────────────────────────
+    # Preserve the HSA as a late-life tax-free reserve instead of spending it
+    # against medical costs as they arise. Off by default (spending it is the
+    # optimal use), but some planners deliberately let it compound.
+    hsa_preserve   = bool(profile.get('hsa_preserve', False))
+
     est_cfg        = profile.get('estate') or {}
     heir_tax_rate  = float(_num(est_cfg.get('heir_tax_rate'), DEFAULT_HEIR_TAX_RATE * 100)) / 100.0
     heir_ltcg_rate = float(_num(est_cfg.get('heir_ltcg_rate'), DEFAULT_HEIR_LTCG_RATE * 100)) / 100.0
@@ -1241,7 +1246,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             #     This is the optimal use of an HSA and keeps the withdrawal
             #     out of taxable income entirely.
             hsa_med_used = 0.0
-            med_remaining = medical_exp
+            med_remaining = 0.0 if hsa_preserve else medical_exp
             if med_remaining > 0:
                 for k, v in acct_defs.items():
                     if v['type'] != 'hsa' or bal[k] <= 0 or med_remaining <= 0:
@@ -1386,7 +1391,18 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         roth_fixed_amt = _num(profile.get('roth_fixed_amount'), 20000)
         ROTH_BRACKET_MAP = {'fill_12': 0.12, 'fill_22': 0.22, 'fill_24': 0.24, 'fill_32': 0.32}
 
-        if do_roth and both_ret and roth_strategy != 'none':
+        # Optional conversion window (p1 ages). Converting is usually most
+        # valuable between retirement and the RMD start age, so being able to
+        # bound it is what makes a multi-year search meaningful.
+        roth_from = profile.get('roth_start_age')
+        roth_to   = profile.get('roth_end_age')
+        in_roth_window = True
+        if roth_from is not None and p1a < int(_num(roth_from, 0)):
+            in_roth_window = False
+        if roth_to is not None and p1a > int(_num(roth_to, 200)):
+            in_roth_window = False
+
+        if do_roth and both_ret and roth_strategy != 'none' and in_roth_window:
             trad_keys = [k for k, v in acct_defs.items() if v['type'] == 'traditional']
             roth_keys = [k for k, v in acct_defs.items() if v['type'] == 'roth']
             trad_bal_total = sum(bal[k] for k in trad_keys)
@@ -1878,6 +1894,90 @@ def optimize_ss(profile):
         'recommended': {'ss1_age': best_a1, 'ss2_age': best_a2},
         'individual_p1': individual_p1,
         'individual_p2': individual_p2,
+    }
+
+
+# ─── MULTI-YEAR ROTH CONVERSION OPTIMIZER ────────────────────────────────────
+
+def optimize_roth(profile, max_end_age=85):
+    """Search conversion strategies on LIFETIME after-tax value.
+
+    The per-year engine is greedy: it fills a target bracket each year with no
+    view of the future. That misses the real trade-off, which is *when* to
+    convert — aggressively in the low-income years between retiring and RMDs,
+    then stopping. This grid-searches (strategy x conversion end age) and ranks
+    on ending after-tax value, so a traditional dollar is never counted as
+    equal to a Roth dollar.
+
+    Returns a ranked comparison plus the recommended settings.
+    """
+    p1 = profile.get('person1') or {}
+    curr_yr = int(_num(profile.get('current_year'), 2026))
+    p1_age  = curr_yr - int(_num(p1.get('birth_year'), 1960))
+    ret_age = int(_num(p1.get('retirement_age'), 65))
+    start_age = max(p1_age, ret_age)
+
+    strategies = ['none', 'fill_12', 'fill_22', 'fill_24', 'fill_32']
+    end_ages = sorted({start_age + 3, start_age + 5, start_age + 8,
+                       start_age + 12, 72, 75, max_end_age})
+    end_ages = [a for a in end_ages if a >= start_age]
+
+    rows = []
+    for strat in strategies:
+        # 'none' does not vary with the window — evaluate it once.
+        candidates = [None] if strat == 'none' else end_ages
+        for end_age in candidates:
+            p = copy.deepcopy(profile)
+            p['roth_strategy'] = strat
+            if end_age is None:
+                p.pop('roth_start_age', None)
+                p.pop('roth_end_age', None)
+            else:
+                p['roth_start_age'] = start_age
+                p['roth_end_age'] = end_age
+            try:
+                proj = project(p)
+            except Exception:
+                continue
+            ret_rows = [r for r in proj if r['phase'] == 'retirement']
+            if not ret_rows:
+                continue
+            last = proj[-1]
+            conv_years = [r for r in ret_rows if r['roth_conversion'] > 0]
+            rows.append({
+                'strategy':          strat,
+                'end_age':           end_age,
+                'after_tax_final':   round(last.get('after_tax_balance',
+                                                    last['total_balance'])),
+                'pretax_final':      round(last['total_balance']),
+                'total_converted':   round(sum(r['roth_conversion'] for r in ret_rows)),
+                'total_conversion_tax': round(sum(r['roth_conversion_tax'] for r in ret_rows)),
+                'lifetime_tax':      round(sum(r['total_tax'] for r in ret_rows)),
+                'conversion_years':  len(conv_years),
+                'shortfall_years':   sum(1 for r in ret_rows if r['shortfall'] > 0),
+                'aca_subsidy_lost':  round(sum(
+                    r.get('aca_subsidy_lost_to_conversion', 0) for r in ret_rows)),
+            })
+
+    if not rows:
+        return {'comparisons': [], 'recommended': None, 'baseline': None}
+
+    # Rank: never trade a funded plan for a shortfall, then maximise after-tax.
+    rows.sort(key=lambda r: (r['shortfall_years'], -r['after_tax_final']))
+    best = rows[0]
+    baseline = next((r for r in rows if r['strategy'] == 'none'), None)
+    gain = (best['after_tax_final'] - baseline['after_tax_final']) if baseline else 0
+
+    return {
+        'comparisons': rows,
+        'recommended': {
+            'strategy':        best['strategy'],
+            'start_age':       start_age if best['end_age'] is not None else None,
+            'end_age':         best['end_age'],
+            'after_tax_final': best['after_tax_final'],
+        },
+        'baseline': baseline,
+        'gain_vs_no_conversion': round(gain),
     }
 
 
@@ -2492,6 +2592,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception:
                 self._fail('Pension calculation failed')
+
+        elif self.path == '/api/optimize_roth':
+            try:
+                self.send_json({'ok': True, **optimize_roth(data)})
+            except Exception as e:
+                self._fail(str(e))
 
         elif self.path == '/api/recommend':
             try:

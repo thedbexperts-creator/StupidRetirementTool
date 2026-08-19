@@ -1,0 +1,95 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the minimum the README claims to support.
+        python-version: ['3.8', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Check app.py compiles
+        run: python -m py_compile app.py
+
+      - name: Run the regression suite
+        run: python test_app.py
+
+      - name: Verify the server starts and serves the API
+        run: |
+          python app.py &
+          SERVER_PID=$!
+          sleep 4
+          python - <<'PY'
+          import json, urllib.request, sys
+
+          def get(path):
+              return json.load(urllib.request.urlopen('http://localhost:5000' + path))
+
+          def post(path, payload):
+              req = urllib.request.Request(
+                  'http://localhost:5000' + path,
+                  data=json.dumps(payload).encode(),
+                  headers={'Content-Type': 'application/json',
+                           'Origin': 'http://localhost:5000',
+                           'Sec-Fetch-Site': 'same-origin'})
+              return json.load(urllib.request.urlopen(req))
+
+          version = get('/api/version')['version']
+          print('version', version)
+
+          profile = get('/api/profile')
+          profile['annual_expenses'] = 80000
+          for acct in profile['accounts'].values():
+              acct['balance'] = 250000
+          profile['person1']['ss_fra_monthly'] = 2500
+
+          for endpoint in ('/api/calculate', '/api/optimize_ss',
+                           '/api/recommend', '/api/monte_carlo'):
+              result = post(endpoint, profile)
+              assert result.get('ok') or 'results' in result, endpoint
+              print('ok', endpoint)
+
+          rows = post('/api/calculate', profile)['results']
+          assert any(r.get('after_tax_balance') is not None for r in rows)
+          print('after_tax_balance present')
+          PY
+          kill $SERVER_PID
+
+      - name: Reject cross-site writes (CSRF guard)
+        run: |
+          python app.py &
+          SERVER_PID=$!
+          sleep 4
+          python - <<'PY'
+          import json, urllib.request, urllib.error
+
+          req = urllib.request.Request(
+              'http://localhost:5000/api/save',
+              data=json.dumps({'annual_expenses': 1}).encode(),
+              headers={'Content-Type': 'application/json',
+                       'Origin': 'https://evil.example',
+                       'Sec-Fetch-Site': 'cross-site'})
+          try:
+              urllib.request.urlopen(req)
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 403, exc.code
+              print('cross-site write correctly refused with 403')
+          else:
+              raise SystemExit('SECURITY REGRESSION: cross-site write was accepted')
+          PY
+          kill $SERVER_PID

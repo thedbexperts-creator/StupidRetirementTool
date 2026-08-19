@@ -822,6 +822,24 @@
     <div id="no-data-roth" class="text-muted text-center py-5">Click <strong>Calculate Plan</strong> to see Roth conversion recommendations.</div>
     <div id="roth-content" style="display:none">
       <div id="roth-note"></div>
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <span>&#128200; Lifetime Conversion Optimizer
+            <small class="text-muted fw-normal ms-2">Searches strategies &times; stop-ages on after-tax value</small>
+          </span>
+          <button type="button" class="btn btn-sm btn-primary" onclick="runRothOptimizer()">
+            Find the best conversion plan
+          </button>
+        </div>
+        <div class="card-body" id="roth-opt-body">
+          <div class="text-muted" style="font-size:13px">
+            The per-year strategy below is greedy — it fills a bracket each year without
+            looking ahead. This searches the real trade-off: how aggressively to convert
+            <em>and when to stop</em>, ranked by what the portfolio is actually worth after
+            the deferred tax is paid.
+          </div>
+        </div>
+      </div>
       <div class="insight-box good mb-3">
         <strong>Roth Conversion Strategy:</strong>
         Choose how aggressively to convert traditional balances to Roth each year. "Fill the bracket" strategies convert just enough to reach the ceiling of a target bracket, avoiding unnecessary tax. Conversions reduce future RMDs and create tax-free growth, but cost tax today.
@@ -1663,6 +1681,7 @@ function saveScenario() {
     // Pre-computed summary metrics
     metrics: {
       finalBalance: lastRow.total_balance || 0,
+      finalAfterTax: (lastRow.after_tax_balance ?? lastRow.total_balance) || 0,
       peakBalance:  maxBal,
       shortfallYrs,
       totalSS,
@@ -1766,6 +1785,9 @@ function renderCompareMetrics() {
     { label: 'Final Portfolio Balance',
       fn: s => fmt(s.metrics.finalBalance),
       best: 'high', num: true, raw: s => s.metrics.finalBalance },
+    { label: 'Final Balance (after tax)',
+      fn: s => fmt(s.metrics.finalAfterTax),
+      best: 'high', num: true, raw: s => s.metrics.finalAfterTax },
     { label: 'Shortfall Years',
       fn: s => s.metrics.shortfallYrs === 0 ? '✓ None' : s.metrics.shortfallYrs + ' yrs',
       best: 'low', num: true, raw: s => s.metrics.shortfallYrs },
@@ -2255,6 +2277,66 @@ function removeLTCEvent(i) {
 }
 
 // ── Roth strategy toggle ───────────────────────────────────────────────────────
+async function runRothOptimizer() {
+  const body = document.getElementById('roth-opt-body');
+  body.innerHTML = '<div class="text-muted">Searching conversion strategies…</div>';
+  try {
+    const res = await fetch('/api/optimize_roth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(getProfileFromForm())
+    });
+    const data = await res.json();
+    if (!data.ok || !data.comparisons?.length) {
+      body.innerHTML = `<div class="text-muted">${data.error || 'No workable strategies found.'}</div>`;
+      return;
+    }
+    const rec = data.recommended, base = data.baseline, gain = data.gain_vs_no_conversion || 0;
+    const label = s => ({none:'No conversions', fill_12:'Fill 12%', fill_22:'Fill 22%',
+                         fill_24:'Fill 24%', fill_32:'Fill 32%'}[s] || s);
+    const verdict = gain > 0
+      ? `<div class="insight-box good"><strong>&#10003; Recommended:</strong>
+           ${label(rec.strategy)}${rec.end_age ? `, stopping at age <strong>${rec.end_age}</strong>` : ''}.
+           Worth about <strong>${fmt(gain)}</strong> more after tax than never converting.</div>`
+      : `<div class="insight-box"><strong>Converting does not pay for this profile.</strong>
+           No strategy beats leaving the money in place once the conversion tax and lost
+           growth are counted. That can change if your heirs would be in a higher bracket —
+           adjust the assumed rate in the estate settings.</div>`;
+
+    let rows = data.comparisons.slice(0, 12).map(r => `
+      <tr class="${r === data.comparisons[0] ? 'table-success' : ''}">
+        <td>${label(r.strategy)}</td>
+        <td>${r.end_age ?? '—'}</td>
+        <td class="text-end text-money">${fmt(r.after_tax_final)}</td>
+        <td class="text-end text-muted">${fmt(r.pretax_final)}</td>
+        <td class="text-end">${fmt(r.total_converted)}</td>
+        <td class="text-end">${fmt(r.total_conversion_tax)}</td>
+        <td class="text-end">${r.aca_subsidy_lost ? fmt(r.aca_subsidy_lost) : '—'}</td>
+        <td class="text-center">${r.shortfall_years || '—'}</td>
+      </tr>`).join('');
+
+    body.innerHTML = verdict + `
+      <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0" style="font-size:12px">
+        <thead><tr>
+          <th>Strategy</th><th>Stop at age</th>
+          <th class="text-end">Final (after tax)</th>
+          <th class="text-end">Final (pre-tax)</th>
+          <th class="text-end">Total converted</th>
+          <th class="text-end">Conversion tax</th>
+          <th class="text-end">ACA subsidy lost</th>
+          <th class="text-center">Shortfall yrs</th>
+        </tr></thead><tbody>${rows}</tbody>
+      </table></div>
+      <div class="text-muted mt-2" style="font-size:11px">
+        Ranked by ending value <em>after</em> the tax still owed on pre-tax accounts.
+        Baseline (no conversions): ${fmt(base?.after_tax_final || 0)} after tax.
+      </div>`;
+  } catch (e) {
+    body.innerHTML = `<div class="text-danger">Optimizer failed: ${e.message}</div>`;
+  }
+}
+
 function onRothStrategyChange() {
   const v = document.getElementById('roth_strategy').value;
   document.getElementById('roth_fixed_col').style.display = (v === 'fixed') ? '' : 'none';
@@ -2735,6 +2817,7 @@ function printReport() {
   <h2>Key Metrics</h2>
   <div class="metrics">
     <div class="mc ${last.total_balance>0?'g':'b'}"><div class="label">Final Portfolio (Age ${last.p1_age})</div><div class="val">${fmtK(last.total_balance||0)}</div></div>
+    <div class="mc ${(last.after_tax_balance??0)>0?'g':'b'}"><div class="label">Final After-Tax Value</div><div class="val">${fmtK(last.after_tax_balance??last.total_balance??0)}</div></div>
     <div class="mc g"><div class="label">Peak Portfolio</div><div class="val">${fmtK(maxBal)}</div></div>
     <div class="mc ${shortfallYrs===0?'g':'b'}"><div class="label">Shortfall Years</div><div class="val">${shortfallYrs===0?'None':shortfallYrs+' yrs'}</div></div>
     <div class="mc w"><div class="label">Avg Annual Tax</div><div class="val">${fmtK(avgTax)}</div></div>
@@ -3357,6 +3440,11 @@ function renderProjection(results) {
       <div class="value">${fmtK(lastRow.total_balance)}</div>
       <div class="sub">Final projected portfolio</div>
     </div></div>
+    <div class="col-md-3"><div class="metric-card metric-info">
+      <div class="label">After-Tax Value</div>
+      <div class="value">${fmtK(lastRow.after_tax_balance ?? lastRow.total_balance)}</div>
+      <div class="sub">What it is really worth — pre-tax accounts still owe income tax</div>
+    </div></div>
     <div class="col-md-3"><div class="metric-card metric-${shortfallYrs.length===0?'good':'warn'}">
       <div class="label">Shortfall Years</div>
       <div class="value">${shortfallYrs.length}</div>
@@ -3383,6 +3471,12 @@ function renderProjection(results) {
   if (shortfallYrs.length === 0) {
     insights += `<div class="insight-box good">&#10003; Your portfolio is projected to last through age ${lastRow.p1_age} with no shortfalls.</div>`;
   }
+  const embeddedTax = (lastRow.total_balance || 0) - (lastRow.after_tax_balance ?? lastRow.total_balance ?? 0);
+  if (embeddedTax > 1000) {
+    const pct = lastRow.total_balance > 0 ? (embeddedTax / lastRow.total_balance * 100) : 0;
+    insights += `<div class="insight-box info">&#127991; Of your ${fmtK(lastRow.total_balance)} final balance, about <strong>${fmtK(embeddedTax)}</strong> (${pct.toFixed(0)}%) is deferred tax still owed on pre-tax accounts — by you or by your heirs. The after-tax value is <strong>${fmtK(lastRow.after_tax_balance)}</strong>.</div>`;
+  }
+
   const rothRows = retRows.filter(r => r.roth_conversion > 0);
   if (rothRows.length > 0) {
     const totalConv = rothRows.reduce((s,r) => s+r.roth_conversion, 0);

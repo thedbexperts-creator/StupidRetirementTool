@@ -530,6 +530,77 @@ class TestPartTimeIncome(unittest.TestCase):
         self.assertLess(first(40000)['aca_subsidy'], first(0)['aca_subsidy'])
 
 
+class TestRothWindowAndOptimizer(unittest.TestCase):
+    def _big_trad(self, heir_rate=24):
+        p = base_profile(annual_expenses=70000)
+        p['person1'].update(birth_year=1962, retirement_age=64, ss_fra_monthly=2200)
+        p['person2'].update(birth_year=1964, retirement_age=64, ss_fra_monthly=1500)
+        p['accounts'] = {
+            't': {'label': '401k', 'type': 'traditional', 'owner': 'p1',
+                  'balance': 1800000, 'growth_rate': 0.07},
+            'r': {'label': 'Roth', 'type': 'roth', 'owner': 'p1',
+                  'balance': 50000, 'growth_rate': 0.07},
+            'b': {'label': 'Brokerage', 'type': 'taxable', 'owner': 'p1',
+                  'balance': 700000, 'growth_rate': 0.07}}
+        p['estate'] = {'heir_tax_rate': heir_rate}
+        return p
+
+    def test_conversion_window_is_respected(self):
+        p = self._big_trad()
+        p['roth_strategy'] = 'fill_22'
+        p['roth_start_age'], p['roth_end_age'] = 66, 70
+        for r in app.project(p):
+            if r['phase'] == 'retirement' and r['roth_conversion'] > 0:
+                self.assertGreaterEqual(r['p1_age'], 66)
+                self.assertLessEqual(r['p1_age'], 70)
+
+    def test_optimizer_returns_ranked_comparisons(self):
+        res = app.optimize_roth(self._big_trad())
+        self.assertTrue(res['comparisons'])
+        scores = [(r['shortfall_years'], -r['after_tax_final'])
+                  for r in res['comparisons']]
+        self.assertEqual(scores, sorted(scores))
+        self.assertIn(res['recommended']['strategy'],
+                      ('none', 'fill_12', 'fill_22', 'fill_24', 'fill_32'))
+
+    def test_converting_gets_more_attractive_as_heir_rate_rises(self):
+        # The whole point of after-tax scoring: converting wins when you pay a
+        # lower rate now than the rate that would otherwise apply later.
+        low = app.optimize_roth(self._big_trad(heir_rate=22))['gain_vs_no_conversion']
+        high = app.optimize_roth(self._big_trad(heir_rate=37))['gain_vs_no_conversion']
+        self.assertGreater(high, low)
+
+    def test_baseline_is_the_no_conversion_case(self):
+        res = app.optimize_roth(self._big_trad())
+        self.assertEqual(res['baseline']['strategy'], 'none')
+        self.assertEqual(res['baseline']['total_converted'], 0)
+
+
+class TestHSAPreserve(unittest.TestCase):
+    def _profile(self, preserve):
+        p = base_profile(roth_strategy='none', annual_expenses=70000)
+        p['person1'].update(birth_year=1968, retirement_age=58)
+        p['person2']['enabled'] = False
+        p['accounts'] = {
+            't': {'label': '401k', 'type': 'traditional', 'owner': 'p1',
+                  'balance': 900000, 'growth_rate': 0.07},
+            'h': {'label': 'HSA', 'type': 'hsa', 'owner': 'p1',
+                  'balance': 150000, 'growth_rate': 0.07}}
+        p['medical'] = {'pre_medicare_annual': 14000, 'post_medicare_annual': 9000,
+                        'medicare_age': 65, 'inflation_rate': 0.05}
+        p['hsa_preserve'] = preserve
+        return p
+
+    def test_preserve_stops_routine_medical_draws(self):
+        spent = [r for r in app.project(self._profile(False))
+                 if r['phase'] == 'retirement'][0]
+        kept = [r for r in app.project(self._profile(True))
+                if r['phase'] == 'retirement'][0]
+        self.assertGreater(spent['withdrawals']['h'], 0)
+        self.assertGreaterEqual(kept['account_balances']['h'],
+                                spent['account_balances']['h'])
+
+
 class TestValidation(unittest.TestCase):
     def test_rejects_non_objects(self):
         self.assertFalse(app.validate_profile([])[0])

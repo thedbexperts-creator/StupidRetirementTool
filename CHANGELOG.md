@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.7] - 2026-08-19
+
+### Added — the after-tax value is now visible
+- 1.0.6 computed `after_tax_balance` and scored the Social Security optimizer on it, but **never displayed it** — the number that changes the Roth conclusion was hidden. It now appears as a headline metric on the results dashboard, as a row in the scenario comparison, in the printed report, and as an insight explaining how much of the final balance is deferred tax rather than money.
+
+### Added — lifetime Roth conversion optimizer
+- The existing strategy is greedy: it fills a bracket each year with no view of the future. The real question is *when to stop* — convert hard in the low-income years between retiring and RMDs, then quit.
+- New `/api/optimize_roth` endpoint and a **Lifetime Conversion Optimizer** panel on the Roth tab. It grid-searches strategy × conversion stop-age and ranks on **after-tax** ending value, reporting total converted, conversion tax, ACA subsidy lost, and shortfall years for each combination. Runs in well under a second.
+- New profile options `roth_start_age` / `roth_end_age` bound the conversion window.
+- Behaviour matches financial theory: converting becomes more valuable as the assumed heir tax rate rises (a $65k gain at a 22% heir rate versus $391k at 37%), and the recommended stop age lands just before RMDs begin.
+- When converting genuinely does not pay, the panel says so plainly rather than recommending a conversion anyway.
+
+### Added — CI, documentation, and an HSA option
+- **GitHub Actions workflow** runs the suite on every push and pull request against Python 3.8 and 3.12, boots the server to check every endpoint responds, and asserts that a cross-site write is still refused with a 403 — so the CSRF protection added in 1.0.2 cannot silently regress. Verified locally before committing.
+- **`ASSUMPTIONS.md`** — a plain-language account of what the tool does and does not model: no relocation, no QCDs, no windfalls or home sale, simplified PFRS, conservative state pension exclusions, IRMAA applied on current-year rather than two-years-prior income, no historical sequence backtesting, and more. The tool is now accurate enough that the *unmodelled* parts are the real risk.
+- **README** refreshed from 1.0.2 to current, with the feature list, a development section, and a pointer to the assumptions doc. `FIXES.md` now redirects to the changelog.
+- New `hsa_preserve` option to keep an HSA compounding as a late-life tax-free reserve instead of spending it against medical costs as they arise.
+
+### Changed
+- Test suite expanded from 68 to **73 tests**, covering the conversion window, optimizer ranking and baseline, the heir-rate sensitivity, and HSA preservation.
+
+---
+
 ## [1.0.6] - 2026-08-19
 
 ### Added — after-tax ending balance
