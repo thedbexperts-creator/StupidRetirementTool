@@ -182,7 +182,7 @@
   <a href="#" class="nav-link active" data-tab="profile"><span class="icon">&#128100;</span>Profile</a>
   <div class="section-label">Analysis</div>
   <a href="#" class="nav-link" data-tab="projection"><span class="icon">&#128200;</span>Income Projection</a>
-  <a href="#" class="nav-link" data-tab="withdrawals"><span class="icon">&#128717;</span>Withdrawal Plan</a>
+  <a href="#" class="nav-link" data-tab="withdrawals"><span class="icon">&#128176;</span>Cash Flow Plan</a>
   <a href="#" class="nav-link" data-tab="ss"><span class="icon">&#128197;</span>SS Optimizer</a>
   <a href="#" class="nav-link" data-tab="roth"><span class="icon">&#128260;</span>Roth Conversions</a>
   <a href="#" class="nav-link" data-tab="taxes"><span class="icon">&#128203;</span>Tax Analysis</a>
@@ -655,24 +655,42 @@
 
   <!-- ══ WITHDRAWALS TAB ══════════════════════════════════════════════════ -->
   <div id="tab-withdrawals" class="tab-pane">
-    <h4 class="section-title">Year-by-Year Withdrawal Plan</h4>
-    <div id="no-data-with" class="text-muted text-center py-5">Click <strong>Calculate Plan</strong> to see your withdrawal plan.</div>
+    <h4 class="section-title">Year-by-Year Cash Flow Plan</h4>
+    <div id="no-data-with" class="text-muted text-center py-5">Click <strong>Calculate Plan</strong> to see your cash flow plan.</div>
     <div id="with-content" style="display:none">
       <div class="insight-box info mb-3">
         <strong>Withdrawal Order Strategy:</strong>
         Taxable accounts (savings, brokerage) are drawn first to let tax-advantaged accounts grow.
-        RMDs from traditional accounts are handled automatically at age 73.
+        RMDs from traditional accounts are handled automatically at the SECURE 2.0 age (73 or 75, by birth year).
         Roth accounts are preserved as long as possible.
         When RMDs exceed spending needs, the after-tax surplus is reinvested into your brokerage account.
+        <div class="mt-2">
+          Click any year for every dollar that moves that year, grouped into
+          <strong>Money In</strong> (each pension, Social Security, wages, RMDs and portfolio draws),
+          <strong>Internal Moves</strong> (Roth conversions and how their tax is paid, reinvestment), and
+          <strong>Money Out</strong> (living costs, healthcare, IRMAA and each tax).
+          Money in minus money out reconciles to that year's surplus or shortfall.
+        </div>
       </div>
       <div class="card mb-3">
         <div class="card-header">Portfolio Withdrawals by Account</div>
         <div class="card-body"><div class="chart-wrap"><canvas id="withdrawalSourceChart"></canvas></div></div>
       </div>
       <div class="card">
-        <div class="card-header d-flex justify-content-between align-items-center">
-          Year-by-Year Detail
-          <small class="text-muted fw-normal">Click any row to see account breakdown</small>
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <span>Year-by-Year Detail
+            <small class="text-muted fw-normal ms-2">Click any row for the full action plan</small>
+          </span>
+          <span class="d-flex align-items-center gap-2">
+            <div class="btn-group btn-group-sm" role="group" aria-label="Detail view mode">
+              <button type="button" class="btn btn-outline-primary active" id="wd-mode-list"
+                      onclick="setWithDetailMode('list')">&#128221; Action List</button>
+              <button type="button" class="btn btn-outline-primary" id="wd-mode-table"
+                      onclick="setWithDetailMode('table')">&#128202; Table</button>
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-secondary"
+                    onclick="exportWithdrawalCSV()">&#11015; CSV</button>
+          </span>
         </div>
         <div class="card-body p-0">
           <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
@@ -3578,28 +3596,8 @@ function renderWithdrawals(results) {
     const isShort = r.shortfall > 0;
     const detailId = 'wdetail-' + idx;
 
-    // Build per-account breakdown HTML
-    const totalDraw = r.withdrawal_total || 0;
-    let detailHtml = '<div style="display:flex;flex-wrap:wrap;gap:12px 28px;">';
-    const activeAccts = acctKeys.filter(k => (r.withdrawals?.[k] || 0) > 0);
-    if (activeAccts.length === 0) {
-      detailHtml += '<span class="text-muted" style="font-size:12px">No portfolio draw this year</span>';
-    } else {
-      activeAccts.forEach(k => {
-        const amt = r.withdrawals[k] || 0;
-        const pct = totalDraw > 0 ? (amt / totalDraw * 100) : 0;
-        const barW = Math.max(pct * 1.5, 2);
-        const color = acctColors[k] || ACCT_DEFAULT_COLOR;
-        detailHtml += `
-          <div class="acct-bar-wrap">
-            <div class="acct-bar" style="width:${barW}px;background:${color}"></div>
-            <span class="acct-pct">${pct.toFixed(0)}%</span>
-            <span class="acct-label">${getLabel(k)}</span>
-            <span class="acct-amt">${fmt(amt)}</span>
-          </div>`;
-      });
-    }
-    detailHtml += '</div>';
+    // Build the itemised action plan (both views) from the backend plan
+    let detailHtml = buildActionDetail(r, getLabel, acctColors);
 
     // Expense breakdown line
     const livingExp = r.living_expenses || r.expenses;
@@ -3634,6 +3632,208 @@ function renderWithdrawals(results) {
         <td colspan="13">${detailHtml}</td>
       </tr>`;
   });
+}
+
+// ── Itemised action plan ──────────────────────────────────────────────────────
+// The backend emits `cash_flow_plan`: an ordered list of concrete money
+// movements (RMD, Roth conversion + how its tax was funded, spending draws,
+// surplus reinvestment). Rendered either as plain-English instructions or as a
+// structured table. Falls back to the old per-account view for older results.
+let withDetailMode = 'list';
+
+const WD_KIND_META = {
+  // Money in
+  pension:              { label: 'Pension',          badge: '#2e9e83' },
+  social_security:      { label: 'Social Security',  badge: '#2e9e83' },
+  wages:                { label: 'Wages',            badge: '#2e9e83' },
+  rmd:                  { label: 'RMD',              badge: '#f0a500' },
+  spend:                { label: 'Withdrawal',       badge: '#4f8ef7' },
+  // Internal moves
+  contribute:           { label: 'Contribution',     badge: '#7b61ff' },
+  convert:              { label: 'Roth conversion',  badge: '#7b61ff' },
+  convert_tax:          { label: 'Conversion tax',   badge: '#b06be0' },
+  convert_tax_withheld: { label: 'Tax withheld',     badge: '#b06be0' },
+  reinvest:             { label: 'Reinvest',         badge: '#27c084' },
+  // Money out
+  living:               { label: 'Living',           badge: '#e05252' },
+  medical:              { label: 'Medical',          badge: '#e05252' },
+  aca:                  { label: 'ACA premiums',     badge: '#e05252' },
+  ltc:                  { label: 'Long-term care',   badge: '#e05252' },
+  irmaa:                { label: 'IRMAA',            badge: '#e05252' },
+  shock:                { label: 'One-time',         badge: '#e05252' },
+  federal_tax:          { label: 'Federal tax',      badge: '#c23b3b' },
+  state_tax:            { label: 'State tax',        badge: '#c23b3b' },
+  fica:                 { label: 'FICA',             badge: '#c23b3b' },
+};
+
+const WD_FLOW_META = {
+  in:       { title: '&#11015; Money In',        color: '#2e9e83' },
+  internal: { title: '&#8646; Internal Moves',   color: '#7b61ff' },
+  out:      { title: '&#11014; Money Out',       color: '#e05252' },
+};
+
+function setWithDetailMode(mode) {
+  withDetailMode = mode;
+  document.getElementById('wd-mode-list')?.classList.toggle('active', mode === 'list');
+  document.getElementById('wd-mode-table')?.classList.toggle('active', mode === 'table');
+  if (projResults && projResults.length) renderWithdrawals(projResults);
+}
+
+// Money in − money out, and what the difference means for that year.
+function reconcileHtml(r) {
+  const tin = r.flow_total_in, tout = r.flow_total_out;
+  if (tin === undefined || tout === undefined) return '';
+  const net = r.flow_net;
+  const short = r.shortfall || 0;
+  let verdict, color;
+  if (short > 0) {
+    verdict = `Shortfall of ${fmt(short)} — the portfolio could not cover this year`;
+    color = '#e05252';
+  } else if (net > 0) {
+    verdict = `${fmt(net)} surplus, reinvested`;
+    color = '#27c084';
+  } else {
+    verdict = 'Fully funded — income exactly covered spending';
+    color = '#5a6a8c';
+  }
+  return `<div style="margin-top:8px;border-top:2px solid #e0e4ee;padding-top:6px;
+              font-size:12px;display:flex;flex-wrap:wrap;gap:16px;align-items:center">
+    <span>Money in <strong class="text-money">${fmt(tin)}</strong></span>
+    <span style="color:#8a95b0">&minus;</span>
+    <span>Money out <strong class="text-money">${fmt(tout)}</strong></span>
+    <span style="color:#8a95b0">=</span>
+    <span style="color:${color};font-weight:700">${verdict}</span>
+  </div>`;
+}
+
+function buildActionDetail(r, getLabel, acctColors) {
+  const plan = r.cash_flow_plan || [];
+  let html = '';
+
+  // Plain-English sentence for one action
+  const phrase = a => {
+    const amt = `<strong>${fmt(a.amount)}</strong>`;
+    switch (a.kind) {
+      case 'pension':         return `Receive ${amt} from <strong>${a.from_label}</strong>`;
+      case 'social_security': return `Receive ${amt} — <strong>${a.from_label}</strong>`;
+      case 'wages':           return `Earn ${amt} — <strong>${a.from_label}</strong>`;
+      case 'rmd':             return `Take ${amt} required minimum distribution from <strong>${a.from_label}</strong>`;
+      case 'spend':           return `Withdraw ${amt} from <strong>${a.from_label}</strong> to fund spending`;
+      case 'contribute':      return `Contribute ${amt} from wages into <strong>${a.to_label}</strong>`;
+      case 'convert':         return `Convert ${amt} from <strong>${a.from_label}</strong> &rarr; deposit into <strong>${a.to_label}</strong>`;
+      case 'convert_tax':     return `Sell ${amt} from <strong>${a.from_label}</strong> to pay the conversion tax`;
+      case 'convert_tax_withheld':
+        return `Withhold ${amt} from the conversion for tax `
+             + `<span class="text-muted">(only the remainder reaches ${a.from_label})</span>`;
+      case 'reinvest':        return `Deposit ${amt} surplus into <strong>${a.to_label}</strong>`;
+      default:                return `Pay ${amt} — <strong>${a.from_label}</strong>`;
+    }
+  };
+
+  const groups = ['in', 'internal', 'out']
+    .map(f => [f, plan.filter(a => a.flow === f)])
+    .filter(([, items]) => items.length);
+
+  if (!plan.length) {
+    html = '<span class="text-muted" style="font-size:12px">No money movement recorded this year.</span>';
+  } else if (withDetailMode === 'list') {
+    groups.forEach(([flow, items]) => {
+      const fm  = WD_FLOW_META[flow];
+      const sub = items.reduce((s, a) => s + a.amount, 0);
+      html += `<div style="margin-bottom:8px">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:${fm.color};
+                    border-bottom:1px solid ${fm.color}33;padding-bottom:3px;margin-bottom:4px;
+                    display:flex;justify-content:space-between">
+          <span>${fm.title}</span>
+          <span>${flow === 'internal' ? '' : fmt(sub)}</span>
+        </div>
+        <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.85">`;
+      items.forEach(a => {
+        const meta = WD_KIND_META[a.kind] || { label: a.kind, badge: '#888' };
+        html += `<li style="margin-bottom:1px">
+          <span class="badge" style="background:${meta.badge};font-size:9px;vertical-align:middle">${meta.label}</span>
+          ${phrase(a)}</li>`;
+      });
+      html += '</ol></div>';
+    });
+    html += reconcileHtml(r);
+  } else {
+    html = `<table class="table table-sm mb-0" style="font-size:12px">
+      <thead><tr>
+        <th>Flow</th><th>Action</th><th>From</th><th>To</th><th class="text-end">Amount</th><th>Why</th>
+      </tr></thead><tbody>`;
+    groups.forEach(([flow, items]) => {
+      const fm = WD_FLOW_META[flow];
+      html += `<tr><td colspan="6" style="background:${fm.color}11;color:${fm.color};
+                 font-weight:700;font-size:10px;letter-spacing:.5px">${fm.title}</td></tr>`;
+      items.forEach(a => {
+        const meta = WD_KIND_META[a.kind] || { label: a.kind, badge: '#888' };
+        html += `<tr>
+          <td><span style="color:${fm.color};font-size:10px">${flow}</span></td>
+          <td><span class="badge" style="background:${meta.badge};font-size:9px">${meta.label}</span></td>
+          <td>${a.from_label || '<span class="text-muted">—</span>'}</td>
+          <td>${a.to_label   || '<span class="text-muted">—</span>'}</td>
+          <td class="text-end text-money">${fmt(a.amount)}</td>
+          <td class="text-muted">${a.note || ''}</td>
+        </tr>`;
+      });
+    });
+    html += '</tbody></table>' + reconcileHtml(r);
+  }
+
+  // Expense breakdown line (unchanged behaviour)
+  const livingExp = r.living_expenses || r.expenses;
+  const medExp = r.medical_expenses || 0;
+  const spMult = r.spending_multiplier || 1;
+  if (medExp > 0 || spMult !== 1) {
+    html += '<div style="margin-top:6px;font-size:12px;color:#666;border-top:1px solid #e0e0e0;padding-top:6px;">';
+    html += `<strong>Expenses:</strong> Living ${fmt(livingExp)}`;
+    if (spMult !== 1) html += ` (${Math.round(spMult*100)}% of base)`;
+    if (medExp > 0) html += ` + Medical ${fmt(medExp)}`;
+    html += ` = <strong>${fmt(r.expenses)}</strong>`;
+    html += '</div>';
+  }
+  return html;
+}
+
+function exportWithdrawalCSV() {
+  if (!projResults || !projResults.length) {
+    notify('Run Calculate Plan first to export the cash flow plan.', 'warning');
+    return;
+  }
+  const ret = projResults.filter(r => r.phase === 'retirement');
+  const esc = v => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const rows = [['Year','P1 Age','P2 Age','Step','Flow','Action','From','To','Amount','Why',
+                 'Year Money In','Year Money Out','Year Net','Shortfall']];
+  ret.forEach(r => {
+    const plan = r.cash_flow_plan || [];
+    if (!plan.length) {
+      rows.push([r.year, r.p1_age, r.p2_age, '', '', 'No activity', '', '', 0,
+                 'No money movement recorded', r.flow_total_in ?? '', r.flow_total_out ?? '',
+                 r.flow_net ?? '', r.shortfall || 0]);
+      return;
+    }
+    plan.forEach((a, i) => {
+      const meta = WD_KIND_META[a.kind] || { label: a.kind };
+      rows.push([r.year, r.p1_age, r.p2_age, i + 1, a.flow || '', meta.label,
+                 a.from_label || '', a.to_label || '', a.amount, a.note || '',
+                 r.flow_total_in ?? '', r.flow_total_out ?? '', r.flow_net ?? '', r.shortfall || 0]);
+    });
+  });
+  const csv = rows.map(r => r.map(esc).join(',')).join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `cash-flow-plan-${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  notify('Cash flow plan exported to CSV.', 'success');
 }
 
 function toggleWithDetail(id, mainRow) {

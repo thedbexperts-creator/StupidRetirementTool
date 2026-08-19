@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.4] - 2026-08-19
+
+### Added — Cash Flow Plan (every dollar that moves)
+- **"Withdrawal Plan" is now the "Cash Flow Plan."** The tab previously showed only money coming *out* of the portfolio. It now accounts for every dollar that moves in a given year, grouped into three sections:
+  - **Money In** — each pension listed by its own name and owner (e.g. *"NYS ERS (Dave)"*), Social Security per person, wages per person, required minimum distributions, and discretionary portfolio withdrawals.
+  - **Internal Moves** — payroll contributions, Roth conversions (source account → destination account), how the conversion tax was funded, and surplus reinvestment. These shift money between accounts rather than in or out of the household.
+  - **Money Out** — living expenses, medical costs, ACA premiums, long-term care, the IRMAA surcharge, one-time expense shocks, and federal / state / FICA taxes itemised separately.
+- **Reconciliation line.** Each year shows `Money in − Money out = surplus or shortfall`, so the numbers visibly tie out. Verified exact (to the dollar) across every projected year in four scenarios: active Roth conversions, still-working years with wages and FICA, portfolio shortfall, and RMD-heavy years with long-term care and one-time shocks.
+- **CSV export extended** with `Flow`, plus per-year `Money In`, `Money Out`, `Net` and `Shortfall` columns; downloads as `cash-flow-plan-<date>.csv`.
+
+### Changed
+- New per-year API fields: `flow_total_in`, `flow_total_out`, `flow_net`. Each entry in `cash_flow_plan` now carries a `flow` field (`in` / `internal` / `out`).
+- The Roth conversion tax is intentionally **not** listed under Money Out — the Internal Moves section already itemises exactly how it was paid (sold from a named account and/or withheld from the conversion). Listing it in both places double-counted it and broke the reconciliation.
+
+---
+
+## [1.0.3] - 2026-08-18
+
+### Added — Itemised withdrawal plan
+- **Step-by-step action plan per year.** The Withdrawal Plan tab now names the exact accounts for every money movement instead of reporting lump sums — e.g. *"Convert $211,228 from 401k (Person 1) → deposit into Roth IRA (Person 1)"*, *"Sell $43,163 from Brokerage to pay the conversion tax"*, *"Withdraw $90,836 from Brokerage to fund spending"*. Expand any year to see it.
+- **RMDs split from discretionary withdrawals.** When one account supplies both a required distribution and additional spending money, they are now separate line items. Previously a single combined figure hid which part was forced: a test year showed one `$175,769` draw that is now itemised as a `$63,291` RMD plus a `$112,478` discretionary withdrawal.
+- **Roth conversion source → destination tracking.** The engine records which traditional account each converted dollar leaves and which Roth account receives it, rather than a single `roth_conversion` total.
+- **Conversion tax funding is shown.** Each year states whether the conversion tax was paid by selling from a named cash/brokerage account or withheld from the conversion itself (in which case only the remainder reaches the Roth).
+- **Surplus reinvestment destination is named** instead of reported as an unattributed total.
+- **Two views + CSV export.** A toggle switches the year detail between a plain-English numbered action list and a structured table (Action / From / To / Amount / Why). A CSV button exports the full year-by-year itemisation for spreadsheets.
+
+### Changed
+- New per-year API fields on retirement rows: `cash_flow_plan` (ordered action list), `rmd_by_account`, `spend_by_account`, `roth_conv_from`, `roth_conv_to`, `roth_conv_tax_cash`, `roth_conv_withheld`, and `reinvest_account`. Existing fields are unchanged, and the itemised amounts reconcile exactly to `withdrawal_total`, `rmd_total`, and `roth_conversion` (verified across every projected year).
+- Accumulation-phase rows carry an empty `cash_flow_plan` so the UI can rely on the key being present.
+
+---
+
 ## [1.0.2] - 2026-08-18
 
 ### Fixed — Roth conversions

@@ -8,7 +8,7 @@ Open: http://localhost:5000
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
-APP_VERSION = '1.0.2'
+APP_VERSION = '1.0.4'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.
@@ -677,6 +677,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 'taxable_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] in ['taxable', 'savings'])),
                 'account_balances': {k: round(v) for k, v in bal.items()},
                 'withdrawals': {k: 0 for k in bal},
+                'cash_flow_plan': [],
             })
             continue
 
@@ -932,13 +933,14 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 basis[k] = basis_snap[k]
 
             w = {k: 0.0 for k in bal}
+            w_rmd = {k: 0.0 for k in bal}   # forced portion, for the action plan
             need = max(0.0, exp - guaranteed + extra_for_tax)
 
             # 1. RMDs (mandatory — always taken regardless of need)
             for k, r in rmds.items():
                 if r > 0:
                     take = min(r, bal[k])
-                    w[k] += take; bal[k] = max(0, bal[k] - take)
+                    w[k] += take; w_rmd[k] += take; bal[k] = max(0, bal[k] - take)
                     need = max(0.0, need - take)
 
             # 2. Taxable accounts — track capital gains.
@@ -1034,6 +1036,13 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         roth_conv = 0.0
         roth_conv_tax = 0.0
         roth_conv_note = None
+        # Action-plan detail: which account each conversion dollar came from,
+        # where it landed, and how the resulting tax bill was paid.
+        conv_from     = {}     # {traditional_key: amount}
+        conv_to       = None   # destination roth key
+        conv_tax_from = {}     # {cash_key: amount sold to pay the tax}
+        conv_tax_cash = 0.0    # total paid from cash
+        conv_withheld = 0.0    # total withheld out of the conversion itself
 
         roth_strategy = str(profile.get('roth_strategy', 'fill_22'))  # fixed, fill_12, fill_22, fill_24, fill_32, none
         roth_fixed_amt = _num(profile.get('roth_fixed_amount'), 20000)
@@ -1102,7 +1111,11 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                                 break
                             take = min(bal[k], rem_conv)
                             bal[k] -= take
+                            conv_from[k] = conv_from.get(k, 0.0) + take
                             rem_conv -= take
+                        conv_to = roth_keys[0]
+                        conv_withheld = withheld
+                        conv_tax_cash = paid_from_cash
                         # Only the net (after any withholding) reaches the Roth.
                         bal[roth_keys[0]] += max(0.0, roth_conv - withheld)
 
@@ -1114,6 +1127,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                             take = min(bal[k], rem_cash)
                             if take <= 0:
                                 continue
+                            conv_tax_from[k] = conv_tax_from.get(k, 0.0) + take
                             if bal[k] > 0:
                                 gain_pct = max(0.0, (bal[k] - basis[k]) / bal[k])
                                 basis[k] = max(0.0, basis[k] - take * (1 - gain_pct))
@@ -1131,6 +1145,11 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         # Roth conversion tax is a strategic cost, not a spending cost, so
         # net_income (which measures "can I cover expenses?") uses pre-Roth tax.
         tax_pre_roth = total_tax
+        # Component split of the spending tax bill, for the cash-flow plan.
+        # (The incremental Roth conversion tax is reported separately, since it
+        # is a strategic cost rather than part of funding this year's living.)
+        fed_tax_spend   = fed_tax
+        state_tax_spend = state_tax
 
         # Recalculate final tax including Roth conversion (for total reporting)
         if roth_conv > 0:
@@ -1159,6 +1178,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             if reinvest_key:
                 bal[reinvest_key] += surplus
                 basis[reinvest_key] += surplus   # already taxed — all basis
+        reinvest_dest = reinvest_key if surplus > 0 else None
 
         # ── GROW ACCOUNTS ────────────────────────────────────────────────────
         # The glide path describes the invested portfolio's stock/bond mix, so
@@ -1188,7 +1208,135 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
 
         total_bal = sum(bal.values())
 
+        # ── ITEMISED CASH FLOW PLAN ──────────────────────────────────────────
+        # Every dollar that moves this year, named and grouped:
+        #   flow 'in'       — money arriving (pensions, SS, wages, portfolio draws)
+        #   flow 'internal' — portfolio-to-portfolio moves (conversions, reinvest)
+        #   flow 'out'      — money leaving (living costs, healthcare, taxes)
+        # Amounts are nominal dollars. Money-in minus money-out reconciles to the
+        # year's surplus or shortfall.
+        def _lbl(key):
+            d = acct_defs.get(key) or {}
+            return d.get('label') or str(key)
+
+        p1_name = str(p1.get('name') or 'Person 1')
+        p2_name = str(p2.get('name') or 'Person 2')
+
+        plan = []
+
+        def _add(kind, amount, src_key=None, dest_key=None, note='',
+                 flow='in', label=None, dest_label=None):
+            if amount is None or round(amount) <= 0:
+                return
+            plan.append({
+                'kind':       kind,
+                'flow':       flow,
+                'from':       src_key,
+                'from_label': label if label else (_lbl(src_key) if src_key else None),
+                'to':         dest_key,
+                'to_label':   dest_label if dest_label else (_lbl(dest_key) if dest_key else None),
+                'amount':     round(amount),
+                'note':       note,
+            })
+
+        # ── MONEY IN ─────────────────────────────────────────────────────────
+        # 1. Pensions — one line per pension, by its own name
+        for _pen, _inc in pen_details:
+            _who = p1_name if _pen.get('owner', 'p1') == 'p1' else p2_name
+            _pname = str(_pen.get('name') or 'Pension')
+            _add('pension', _inc, flow='in',
+                 label=f'{_pname} ({_who})',
+                 note='Pension income')
+
+        # 2. Social Security — per person
+        _add('social_security', ss1_ann, flow='in',
+             label=f'Social Security — {p1_name}', note='Social Security benefit')
+        if p2_enabled:
+            _add('social_security', ss2_ann, flow='in',
+                 label=f'Social Security — {p2_name}', note='Social Security benefit')
+
+        # 3. Wages, for anyone still working
+        _add('wages', p1_work, flow='in', label=f'Wages — {p1_name}',
+             note='Employment income')
+        if p2_enabled:
+            _add('wages', p2_work, flow='in', label=f'Wages — {p2_name}',
+                 note='Employment income')
+
+        # 4. Required minimum distributions (forced portfolio draw)
+        for k in acct_defs:
+            _add('rmd', w_rmd.get(k, 0.0), src_key=k, flow='in',
+                 note='Required minimum distribution')
+
+        # 5. Discretionary withdrawals to fund spending (net of the RMD part)
+        for k in acct_defs:
+            _add('spend', w.get(k, 0.0) - w_rmd.get(k, 0.0), src_key=k, flow='in',
+                 note='To fund living expenses')
+
+        # ── INTERNAL MOVES ───────────────────────────────────────────────────
+        # 6. Payroll contributions while still working
+        _add('contribute', contrib_total, flow='internal',
+             label='Wages', dest_label='Retirement accounts',
+             note='Contributed from wages')
+
+        # 7. Roth conversions — source account → destination account
+        for k, amt in conv_from.items():
+            _add('convert', amt, src_key=k, dest_key=conv_to, flow='internal',
+                 note='Roth conversion')
+
+        # 8. How the conversion tax was funded
+        for k, amt in conv_tax_from.items():
+            _add('convert_tax', amt, src_key=k, flow='internal',
+                 note='Sold to pay Roth conversion tax')
+        _add('convert_tax_withheld', conv_withheld, src_key=conv_to, flow='internal',
+             note='Tax withheld from the conversion (never reaches the Roth)')
+
+        # 9. Surplus reinvestment
+        _add('reinvest', surplus, dest_key=reinvest_dest, flow='internal',
+             note='After-tax surplus reinvested')
+
+        # ── MONEY OUT ────────────────────────────────────────────────────────
+        _add('living', living_exp, flow='out', label='Living expenses',
+             note=(f'{round(phase_mult*100)}% of base spending'
+                   if phase_mult != 1 else 'Base spending'))
+        _add('medical', p1_med + p2_med, flow='out', label='Medical costs',
+             note='Out-of-pocket healthcare')
+        _add('aca', aca_exp, flow='out', label='ACA premiums',
+             note='Pre-Medicare health insurance')
+        _add('ltc', ltc_exp, flow='out', label='Long-term care',
+             note='Net of any LTC insurance')
+        _add('irmaa', irmaa_cost, flow='out', label='IRMAA surcharge',
+             note='Income-related Medicare surcharge')
+        _add('shock', shock_amt, flow='out', label='One-time expense',
+             note='Planned one-off cost this year')
+        _add('federal_tax', fed_tax_spend, flow='out', label='Federal income tax',
+             note='On pensions, SS, wages and withdrawals')
+        _add('state_tax', state_tax_spend, flow='out', label='State income tax',
+             note='State tax on taxable income')
+        _add('fica', total_fica, flow='out', label='FICA (payroll tax)',
+             note='Social Security + Medicare on wages')
+        # NOTE: the Roth conversion tax is deliberately NOT listed here. It is a
+        # strategic cost funded from the portfolio, and the internal-moves
+        # section already itemises exactly how it was paid (sold from a named
+        # account and/or withheld). Listing it again would double-count it and
+        # break the in/out reconciliation.
+
+        # Reconciliation totals for the UI
+        _flow_in  = sum(x['amount'] for x in plan if x['flow'] == 'in')
+        _flow_out = sum(x['amount'] for x in plan if x['flow'] == 'out')
+
         results.append({
+            'cash_flow_plan': plan,
+            'flow_total_in':  _flow_in,
+            'flow_total_out': _flow_out,
+            'flow_net':       _flow_in - _flow_out,
+            'rmd_by_account':   {k: round(v) for k, v in w_rmd.items() if round(v) > 0},
+            'spend_by_account': {k: round(w[k] - w_rmd.get(k, 0.0))
+                                 for k in w if round(w[k] - w_rmd.get(k, 0.0)) > 0},
+            'roth_conv_from':      {k: round(v) for k, v in conv_from.items() if round(v) > 0},
+            'roth_conv_to':        conv_to,
+            'roth_conv_tax_cash':  round(conv_tax_cash),
+            'roth_conv_withheld':  round(conv_withheld),
+            'reinvest_account':    reinvest_dest,
             'year': yr, 'p1_age': p1a, 'p2_age': p2a, 'phase': 'retirement',
             'expenses': round(exp),
             'living_expenses': round(living_exp),
