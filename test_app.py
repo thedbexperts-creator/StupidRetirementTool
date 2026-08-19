@@ -391,6 +391,145 @@ class TestMonteCarlo(unittest.TestCase):
         self.assertEqual(res['inflation_vol'], 2.0)
 
 
+class TestAfterTaxValue(unittest.TestCase):
+    """A traditional dollar is not a Roth dollar."""
+
+    def test_traditional_is_discounted(self):
+        defs = {'t': {'type': 'traditional'}}
+        v = app.after_tax_value({'t': 100000}, {}, defs, heir_rate=0.24)
+        self.assertAlmostEqual(v, 76000.0, places=2)
+
+    def test_roth_and_hsa_are_full_value(self):
+        defs = {'r': {'type': 'roth'}, 'h': {'type': 'hsa'}}
+        v = app.after_tax_value({'r': 50000, 'h': 50000}, {}, defs)
+        self.assertAlmostEqual(v, 100000.0, places=2)
+
+    def test_step_up_basis_removes_gains_tax(self):
+        defs = {'b': {'type': 'taxable'}}
+        bal, basis = {'b': 100000}, {'b': 40000}
+        with_step = app.after_tax_value(bal, basis, defs, step_up_basis=True)
+        without = app.after_tax_value(bal, basis, defs, step_up_basis=False,
+                                      ltcg_rate=0.15)
+        self.assertAlmostEqual(with_step, 100000.0, places=2)
+        self.assertAlmostEqual(without, 100000 - 60000 * 0.15, places=2)
+
+    def test_after_tax_never_exceeds_pretax(self):
+        for r in app.project(base_profile(roth_strategy='none')):
+            self.assertLessEqual(r['after_tax_balance'], r['total_balance'] + 1)
+
+    def test_optimizer_scores_on_after_tax_value(self):
+        # REGRESSION: scoring on the raw balance treated pre-tax and Roth
+        # dollars as equal, understating the value of conversions.
+        res = app.optimize_ss(base_profile())
+        for row in res['comparisons']:
+            self.assertEqual(row['score'], row['final_balance'])
+
+
+class TestHSA(unittest.TestCase):
+    def test_hsa_is_a_valid_account_type(self):
+        self.assertIn('hsa', app.ACCOUNT_TYPES)
+        p = base_profile()
+        p['accounts']['h'] = {'label': 'HSA', 'type': 'hsa', 'owner': 'p1',
+                              'balance': 100000, 'growth_rate': 0.07}
+        self.assertTrue(app.validate_profile(p)[0])
+
+    def _hsa_profile(self, hsa_balance=150000):
+        p = base_profile(roth_strategy='none', annual_expenses=70000)
+        p['person1'].update(birth_year=1968, retirement_age=58)
+        p['person2']['enabled'] = False
+        p['accounts'] = {
+            't': {'label': '401k', 'type': 'traditional', 'owner': 'p1',
+                  'balance': 800000, 'growth_rate': 0.07},
+            'b': {'label': 'Brokerage', 'type': 'taxable', 'owner': 'p1',
+                  'balance': 400000, 'growth_rate': 0.07},
+            'h': {'label': 'HSA', 'type': 'hsa', 'owner': 'p1',
+                  'balance': hsa_balance, 'growth_rate': 0.07},
+        }
+        p['medical'] = {'pre_medicare_annual': 14000, 'post_medicare_annual': 9000,
+                        'medicare_age': 65, 'inflation_rate': 0.05}
+        return p
+
+    def test_hsa_pays_medical_costs_first(self):
+        ret = [r for r in app.project(self._hsa_profile())
+               if r['phase'] == 'retirement']
+        first = ret[0]
+        self.assertGreater(first['withdrawals']['h'], 0)
+        # The HSA draw should not exceed that year's medical bill.
+        self.assertLessEqual(first['withdrawals']['h'],
+                             first['medical_expenses'] + 1)
+
+    def test_hsa_withdrawal_for_medical_is_untaxed(self):
+        # An HSA-only medical draw must not add to taxable income.
+        with_hsa = app.project(self._hsa_profile(hsa_balance=400000))
+        without = app.project(self._hsa_profile(hsa_balance=0))
+        a = [r for r in with_hsa if r['phase'] == 'retirement'][0]
+        b = [r for r in without if r['phase'] == 'retirement'][0]
+        self.assertLessEqual(a['federal_tax'], b['federal_tax'] + 1)
+
+    def test_hsa_is_not_subject_to_rmd(self):
+        p = self._hsa_profile()
+        p['person1']['birth_year'] = 1950     # well past any RMD age
+        for r in app.project(p):
+            if r['phase'] == 'retirement':
+                self.assertEqual(r.get('rmd_by_account', {}).get('h', 0), 0)
+
+    def test_no_hsa_contributions_after_medicare_age(self):
+        p = base_profile(annual_expenses=60000)
+        p['person1'].update(birth_year=1955, retirement_age=75)   # working at 71
+        p['person2']['enabled'] = False
+        p['person1']['annual_income'] = 120000
+        p['accounts'] = {'h': {'label': 'HSA', 'type': 'hsa', 'owner': 'p1',
+                               'balance': 50000, 'growth_rate': 0.0}}
+        p['contributions'] = {'h': 8000}
+        rows = app.project(p)
+        # Owner is already past 65 in every projected year, so nothing may go in.
+        self.assertTrue(all(r.get('contributions_total', 0) == 0 for r in rows))
+
+
+class TestPartTimeIncome(unittest.TestCase):
+    def _profile(self, amount):
+        p = base_profile(roth_strategy='none', annual_expenses=80000)
+        p['person1'].update(birth_year=1966, retirement_age=60,
+                            part_time_income=amount,
+                            part_time_start_age=60, part_time_end_age=67)
+        p['person2']['enabled'] = False
+        p['accounts'] = {
+            't': {'label': '401k', 'type': 'traditional', 'owner': 'p1',
+                  'balance': 700000, 'growth_rate': 0.07},
+            'b': {'label': 'Brokerage', 'type': 'taxable', 'owner': 'p1',
+                  'balance': 300000, 'growth_rate': 0.07}}
+        return p
+
+    def test_income_appears_only_within_the_age_window(self):
+        ret = [r for r in app.project(self._profile(40000))
+               if r['phase'] == 'retirement']
+        by_age = {r['p1_age']: r['part_time_income'] for r in ret}
+        self.assertGreater(by_age[60], 0)
+        self.assertGreater(by_age[67], 0)
+        self.assertEqual(by_age[68], 0)
+
+    def test_reduces_portfolio_withdrawals(self):
+        with_pt = [r for r in app.project(self._profile(40000))
+                   if r['phase'] == 'retirement'][0]
+        without = [r for r in app.project(self._profile(0))
+                   if r['phase'] == 'retirement'][0]
+        self.assertLess(with_pt['withdrawal_total'], without['withdrawal_total'])
+
+    def test_is_earned_income_and_pays_fica(self):
+        r = [x for x in app.project(self._profile(40000))
+             if x['phase'] == 'retirement'][0]
+        # 7.65% employee share below the wage base.
+        self.assertAlmostEqual(r['fica_tax'], 40000 * 0.0765, delta=50)
+
+    def test_counts_toward_aca_magi(self):
+        # Earned income raises MAGI and therefore shrinks the premium credit.
+        def first(amount):
+            p = self._profile(amount)
+            p['aca'] = {'enabled': True, 'monthly_premium': 900, 'inflation': 0.05}
+            return [r for r in app.project(p) if r['phase'] == 'retirement'][0]
+        self.assertLess(first(40000)['aca_subsidy'], first(0)['aca_subsidy'])
+
+
 class TestValidation(unittest.TestCase):
     def test_rejects_non_objects(self):
         self.assertFalse(app.validate_profile([])[0])

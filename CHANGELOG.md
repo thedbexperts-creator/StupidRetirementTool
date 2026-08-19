@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.6] - 2026-08-19
+
+### Added — after-tax ending balance
+- Both optimizers previously scored plans on the **pre-tax** ending balance, treating $1 in a traditional 401(k) as equal to $1 in a Roth even though the traditional dollar still owes ordinary income tax — to the retiree or to heirs under the SECURE Act 10-year rule. This systematically understated the case for Roth conversions, the mirror image of the double-counting bug fixed in 1.0.4.
+- Every projected year now reports `after_tax_balance`: traditional balances discounted by an assumed heir rate, Roth and HSA at full value, and unrealized gains in taxable accounts taxed only if heirs do **not** receive a stepped-up basis (they do by default under current law). Configure via `estate.heir_tax_rate`, `estate.heir_ltcg_rate` and `estate.step_up_basis`.
+- The Social Security optimizer now scores on after-tax value. In a test profile this narrowed the apparent gap between "never convert" and "fill the 22% bracket" from **$722k to $212k** — the comparison is now honest rather than flattering the do-nothing strategy.
+
+### Added — HSA accounts
+- New `hsa` account type, the only triple-tax-advantaged vehicle: contributions are pre-tax, growth is untaxed, and withdrawals for qualified medical costs are tax-free.
+- The engine spends the HSA against each year's medical bill **first**, keeping those dollars out of taxable income entirely. Anything left is treated as a true last resort after Roth, where a post-65 non-medical withdrawal is simply ordinary income.
+- HSA contributions reduce MAGI, which matters directly for the ACA cliff added in 1.0.5 — an HSA contribution can be exactly what keeps a pre-Medicare household under 400% FPL.
+- Contributions are correctly barred once the owner reaches Medicare age, and HSAs are never subject to RMDs.
+
+### Added — part-time / phased retirement income
+- Each person can now earn part-time income after their official retirement date, with a configurable age window (`part_time_income`, `part_time_start_age`, `part_time_end_age`).
+- It is modelled as genuine **earned** income: it pays FICA, lands in AGI, and counts toward ACA MAGI. In testing, $40,000 of consulting income cut the first-year portfolio withdrawal from $90,800 to $52,002 — but also pushed the household from 1.16x to 3.22x FPL, roughly halving the premium tax credit. Both effects are now visible instead of only the first.
+
+### Changed
+- Test suite expanded from 54 to **68 tests**, covering after-tax valuation, HSA ordering and tax treatment, the Medicare contribution cut-off, and the part-time income window and its ACA interaction.
+- Profile tab gains part-time income fields for each person; the account editor offers HSA as a type.
+
+---
+
 ## [1.0.5] - 2026-08-19
 
 ### Fixed — 18 states were silently taxed as New York

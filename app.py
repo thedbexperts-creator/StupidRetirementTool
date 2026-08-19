@@ -8,7 +8,7 @@ Open: http://localhost:5000
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
-APP_VERSION = '1.0.5'
+APP_VERSION = '1.0.6'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.
@@ -379,7 +379,11 @@ def _dict_list(value):
     return [v for v in value if isinstance(v, dict)]
 
 
-ACCOUNT_TYPES = ('traditional', 'roth', 'taxable', 'savings')
+# 'hsa' — Health Savings Account. Uniquely triple tax-advantaged: pre-tax in,
+# tax-free growth, tax-free out for qualified medical costs. It is also the one
+# account whose contributions LOWER MAGI, which can keep a pre-Medicare
+# household under the 400% FPL ACA subsidy cliff.
+ACCOUNT_TYPES = ('traditional', 'roth', 'taxable', 'savings', 'hsa')
 
 
 def normalize_accounts(raw_accounts):
@@ -636,6 +640,47 @@ def niit_tax(net_investment_income, magi, use_single=False):
     return NIIT_RATE * min(net_investment_income, excess)
 
 
+# ─── AFTER-TAX ("what is it actually worth") VALUATION ────────────────────────
+# A dollar in a traditional account is not a dollar: it still owes ordinary
+# income tax, either to the retiree or to heirs under the SECURE Act 10-year
+# rule. Scoring plans on the raw pre-tax balance therefore treats a traditional
+# dollar as equal to a Roth dollar and systematically understates the value of
+# Roth conversions. This converts a portfolio to spendable, after-tax value.
+
+DEFAULT_HEIR_TAX_RATE = 0.24     # assumed ordinary rate on inherited pre-tax $
+DEFAULT_HEIR_LTCG_RATE = 0.15    # if heirs do NOT get a stepped-up basis
+
+def after_tax_value(balances, basis, acct_defs,
+                    heir_rate=DEFAULT_HEIR_TAX_RATE,
+                    ltcg_rate=DEFAULT_HEIR_LTCG_RATE,
+                    step_up_basis=True):
+    """Spendable value of a portfolio.
+
+      traditional / hsa-nonmedical : taxed as ordinary income at heir_rate
+      roth                         : already tax free
+      taxable / savings            : unrealized gain taxed at ltcg_rate,
+                                     unless heirs receive a stepped-up basis
+                                     (the default under current law)
+    """
+    total = 0.0
+    for k, v in acct_defs.items():
+        b = float(balances.get(k, 0.0))
+        if b <= 0:
+            continue
+        t = v.get('type', 'taxable')
+        if t == 'traditional':
+            total += b * (1.0 - heir_rate)
+        elif t in ('roth', 'hsa'):
+            # HSA inherited by a non-spouse is taxable, but for the retiree's
+            # own qualified medical use it is tax free; treated as tax free
+            # here to match how the projection spends it.
+            total += b
+        else:
+            gain = max(0.0, b - float(basis.get(k, 0.0)))
+            total += b - (0.0 if step_up_basis else gain * ltcg_rate)
+    return total
+
+
 def rmd_start_age(birth_year):
     """SECURE 2.0 required-beginning age: 73 for those born 1951-1959,
     75 for those born 1960 or later."""
@@ -688,6 +733,12 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         pensions_list = [p for p in [pen1_old, pen2_old] if p]
     pensions_list = _dict_list(pensions_list)
     annual_exp = _num(profile.get('annual_expenses'), 0)
+
+    # ── After-tax valuation assumptions ──────────────────────────────────────
+    est_cfg        = profile.get('estate') or {}
+    heir_tax_rate  = float(_num(est_cfg.get('heir_tax_rate'), DEFAULT_HEIR_TAX_RATE * 100)) / 100.0
+    heir_ltcg_rate = float(_num(est_cfg.get('heir_ltcg_rate'), DEFAULT_HEIR_LTCG_RATE * 100)) / 100.0
+    step_up_basis  = bool(est_cfg.get('step_up_basis', True))
 
     # State tax configuration
     (st_brackets_mfj, st_std_ded_mfj,
@@ -870,7 +921,9 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 'total_ss': 0, 'federal_tax': 0, 'state_tax': 0, 'total_tax': 0,
                 'net_income': 0, 'shortfall': 0, 'roth_conversion': 0, 'rmd_total': 0,
                 'total_balance': round(total_bal),
-                'trad_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'traditional')),
+                'after_tax_balance': round(after_tax_value(
+                bal, basis, acct_defs, heir_tax_rate, heir_ltcg_rate, step_up_basis)),
+            'trad_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'traditional')),
                 'roth_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'roth')),
                 'taxable_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] in ['taxable', 'savings'])),
                 'account_balances': {k: round(v) for k, v in bal.items()},
@@ -1035,6 +1088,29 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         yrs_elapsed = yr - curr_yr
         p1_work = p1_gross_income * (1 + inflation) ** yrs_elapsed if (p1_working and p1_alive) else 0.0
         p2_work = p2_gross_income * (1 + inflation) ** yrs_elapsed if (p2_working and p2_alive) else 0.0
+
+        # ── Part-time / phased-retirement earnings ───────────────────────────
+        # Consulting or part-time work after the official retirement date. This
+        # is EARNED income: it pays FICA, lands in AGI, and counts toward ACA
+        # MAGI — so it can reduce a premium tax credit as well as fund spending.
+        def _part_time(person, age, alive):
+            if not alive:
+                return 0.0
+            amt = _num(person.get('part_time_income'), 0)
+            if amt <= 0:
+                return 0.0
+            start = int(_num(person.get('part_time_start_age'),
+                             _num(person.get('retirement_age'), 65)))
+            end   = int(_num(person.get('part_time_end_age'), 70))
+            if age < start or age > end:
+                return 0.0
+            return amt * (1 + inflation) ** yrs_elapsed
+
+        p1_part = _part_time(p1, p1a, p1_alive)
+        p2_part = _part_time(p2, p2a, p2_alive) if p2_enabled else 0.0
+        p1_work += p1_part
+        p2_work += p2_part
+
         working_income = p1_work + p2_work
         total_fica = fica_tax(p1_work, yrs_since_2024) + fica_tax(p2_work, yrs_since_2024)
 
@@ -1054,6 +1130,10 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 if (owner == 'p1' and p1_working) or (owner == 'p2' and p2_working):
                     owner_age = p1a if owner == 'p1' else p2a
                     c = _num(contribs.get(k, 0))
+                    # HSA contributions are not permitted once enrolled in
+                    # Medicare (age 65 by default).
+                    if v['type'] == 'hsa' and owner_age >= med_age:
+                        continue
                     if owner_age >= 50:
                         if owner_age >= 60 and owner_age <= 63:
                             c += _num(super_cups.get(k, catch_ups.get(k, 0)))
@@ -1074,8 +1154,8 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                 bal[k] = max(0.0, bal[k] + c)
                 if v['type'] in ('taxable', 'savings'):
                     basis[k] += c      # already-taxed money — adds to basis
-                if v['type'] == 'traditional':
-                    contrib_pretax += c
+                if v['type'] in ('traditional', 'hsa'):
+                    contrib_pretax += c    # both reduce taxable wages and MAGI
                 contrib_total += c
 
         # Salary left over after funding the contributions is what can be spent.
@@ -1157,6 +1237,23 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                     w[k] += take; w_rmd[k] += take; bal[k] = max(0, bal[k] - take)
                     need = max(0.0, need - take)
 
+            # 1b. HSA — spend tax-free against this year's medical costs first.
+            #     This is the optimal use of an HSA and keeps the withdrawal
+            #     out of taxable income entirely.
+            hsa_med_used = 0.0
+            med_remaining = medical_exp
+            if med_remaining > 0:
+                for k, v in acct_defs.items():
+                    if v['type'] != 'hsa' or bal[k] <= 0 or med_remaining <= 0:
+                        continue
+                    take = min(bal[k], med_remaining, need if need > 0 else med_remaining)
+                    take = min(bal[k], med_remaining)
+                    w[k] += take
+                    bal[k] -= take
+                    med_remaining -= take
+                    hsa_med_used += take
+                    need = max(0.0, need - take)
+
             # 2. Taxable accounts — track capital gains.
             #    Savings/HYSA basis tracks its balance (interest is taxed as
             #    earned, below), so only brokerage realizes a gain here.
@@ -1186,6 +1283,15 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                     take = min(bal[k], need)
                     w[k] += take; bal[k] -= take; need -= take
 
+            # 5. HSA left over — after 65 a non-medical HSA withdrawal is simply
+            #    ordinary income (no penalty), so it is the true last resort.
+            hsa_nonmed = 0.0
+            for k, v in acct_defs.items():
+                if v['type'] == 'hsa' and need > 0 and bal[k] > 0:
+                    take = min(bal[k], need)
+                    w[k] += take; bal[k] -= take; need -= take
+                    hsa_nonmed += take
+
             # Savings/HYSA interest is taxable in the year it is earned, even if
             # never withdrawn. Computed on the post-withdrawal balance; the
             # matching basis credit happens in the growth step below.
@@ -1198,7 +1304,8 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             trad_w       = sum(w[k] for k, v in acct_defs.items() if v['type'] == 'traditional')
             # Federal: all pension income is ordinary income regardless of the
             # state exemption. Wages are net of pre-tax 401(k) contributions.
-            fed_ordinary = pen1_inc + pen2_inc + trad_w + savings_interest + taxable_wages
+            fed_ordinary = (pen1_inc + pen2_inc + trad_w + savings_interest
+                        + taxable_wages + hsa_nonmed)
             # Provisional income for the SS calculation includes capital gains.
             tx_ss        = taxable_ss_portion(total_ss, fed_ordinary + taxable_gains, use_single)
             fed_ordinary += tx_ss
@@ -1216,7 +1323,8 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             st_pen_inc   = sum(inc for pen, inc in pen_details if not pen.get('nys_exempt', False))
             st_excl_used = min(state_excl, st_pen_inc + trad_w)
             st_taxable   = max(0.0, st_pen_inc + trad_w + savings_interest
-                               + taxable_gains + taxable_wages + st_ss - st_excl_used)
+                               + taxable_gains + taxable_wages + hsa_nonmed
+                               + st_ss - st_excl_used)
 
             fed_niit  = niit_tax(taxable_gains + savings_interest,
                                  fed_income + taxable_gains, use_single)
@@ -1628,6 +1736,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             'ss_p2': round(ss2_ann),
             'total_ss': round(total_ss),
             'working_income': round(working_income),
+            'part_time_income': round(p1_part + p2_part),
             'contributions_total': round(contrib_total),
             'fica_tax': round(total_fica),
             'shock_expense': round(shock_amt),
@@ -1648,6 +1757,8 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             'net_income': round(guaranteed + sum(w.values()) - tax_pre_roth),
             'shortfall': round(shortfall),
             'total_balance': round(total_bal),
+            'after_tax_balance': round(after_tax_value(
+                bal, basis, acct_defs, heir_tax_rate, heir_ltcg_rate, step_up_basis)),
             'trad_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'traditional')),
             'roth_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] == 'roth')),
             'taxable_balance': round(sum(bal[k] for k, v in acct_defs.items() if v['type'] in ['taxable', 'savings'])),
@@ -1673,7 +1784,7 @@ def _run_ss_scenario(profile, a1, a2):
     ss_p1      = sum(r['ss_p1']     for r in ret_rows)
     ss_p2      = sum(r['ss_p2']     for r in ret_rows)
     total_tax  = sum(r['total_tax'] for r in ret_rows)
-    final_bal  = proj[-1]['total_balance']
+    final_bal  = proj[-1].get('after_tax_balance', proj[-1]['total_balance'])
     shortfall_yrs = sum(1 for r in ret_rows if r['shortfall'] > 0)
     return {
         'ss1_age': a1, 'ss2_age': a2,
@@ -1683,7 +1794,9 @@ def _run_ss_scenario(profile, a1, a2):
         'total_lifetime_tax': round(total_tax),
         'final_balance':     round(final_bal),
         'shortfall_years':   shortfall_yrs,
-        # Score = ending portfolio value. Expenses are identical across
+        # Score = ending portfolio value, measured AFTER embedded tax, so a
+        # traditional dollar is not counted as equal to a Roth dollar.
+        # Expenses are identical across
         # scenarios, so the terminal balance already captures the whole effect
         # of the claiming decision: more Social Security means smaller
         # withdrawals, and taxes are paid out of the portfolio along the way.

@@ -227,6 +227,17 @@
                 <div class="input-group"><span class="input-group-text">$</span>
                 <input class="form-control dollar-input" type="text" id="p1_annual_income" placeholder="e.g. 85,000"></div>
               </div>
+              <div class="col-12"><hr class="my-1"></div>
+              <div class="col-4">
+                <label class="form-label">Part-Time Income <small class="text-muted">(after retiring)</small></label>
+                <div class="input-group"><span class="input-group-text">$</span>
+                <input class="form-control dollar-input" type="text" id="p1_part_time_income" placeholder="0"></div>
+              </div>
+              <div class="col-4"><label class="form-label">From Age</label>
+                <input class="form-control" type="number" id="p1_part_time_start_age" placeholder="60"></div>
+              <div class="col-4"><label class="form-label">To Age</label>
+                <input class="form-control" type="number" id="p1_part_time_end_age" placeholder="70">
+              </div>
             </div>
           </div>
         </div>
@@ -261,6 +272,17 @@
                 <label class="form-label">Current Gross Annual Income <small class="text-muted">— while still working (0 if retired)</small></label>
                 <div class="input-group"><span class="input-group-text">$</span>
                 <input class="form-control dollar-input" type="text" id="p2_annual_income" placeholder="e.g. 85,000"></div>
+              </div>
+              <div class="col-12"><hr class="my-1"></div>
+              <div class="col-4">
+                <label class="form-label">Part-Time Income <small class="text-muted">(after retiring)</small></label>
+                <div class="input-group"><span class="input-group-text">$</span>
+                <input class="form-control dollar-input" type="text" id="p2_part_time_income" placeholder="0"></div>
+              </div>
+              <div class="col-4"><label class="form-label">From Age</label>
+                <input class="form-control" type="number" id="p2_part_time_start_age" placeholder="60"></div>
+              <div class="col-4"><label class="form-label">To Age</label>
+                <input class="form-control" type="number" id="p2_part_time_end_age" placeholder="70">
               </div>
             </div>
           </div>
@@ -2046,6 +2068,9 @@ function renderProfile() {
   document.getElementById('p1_life_expectancy').value = p1.life_expectancy || 90;
   document.getElementById('p1_ss_fra_monthly').value = p1.ss_fra_monthly || 0;
   document.getElementById('p1_annual_income').value = p1.annual_income || 0;
+  document.getElementById('p1_part_time_income').value = p1.part_time_income || 0;
+  document.getElementById('p1_part_time_start_age').value = p1.part_time_start_age || '';
+  document.getElementById('p1_part_time_end_age').value = p1.part_time_end_age || '';
 
   const p2Enabled = p2.enabled !== false;
   document.getElementById('p2_enabled').checked = p2Enabled;
@@ -2056,6 +2081,9 @@ function renderProfile() {
   document.getElementById('p2_life_expectancy').value = p2.life_expectancy || 90;
   document.getElementById('p2_ss_fra_monthly').value = p2.ss_fra_monthly || 0;
   document.getElementById('p2_annual_income').value = p2.annual_income || 0;
+  document.getElementById('p2_part_time_income').value = p2.part_time_income || 0;
+  document.getElementById('p2_part_time_start_age').value = p2.part_time_start_age || '';
+  document.getElementById('p2_part_time_end_age').value = p2.part_time_end_age || '';
 
   renderPensionsSection();
 
@@ -2838,7 +2866,7 @@ function renderAccountsTable() {
   const contribs = profile.contributions || {};
   const catchUps = profile.catch_up_contributions || {};
   const superCups = profile.super_catch_up_contributions || {};
-  const typeOpts = ['traditional','roth','taxable','savings'];
+  const typeOpts = ['traditional','roth','taxable','savings','hsa'];
   const ownerOpts = ['p1','p2'];
 
   tbody.innerHTML = '';
@@ -3001,6 +3029,9 @@ function getProfileFromForm() {
   p.person1.life_expectancy = +document.getElementById('p1_life_expectancy').value || 90;
   p.person1.ss_fra_monthly = parseDollar(document.getElementById('p1_ss_fra_monthly').value);
   p.person1.annual_income = parseDollar(document.getElementById('p1_annual_income').value) || 0;
+  p.person1.part_time_income = parseDollar(document.getElementById('p1_part_time_income').value) || 0;
+  p.person1.part_time_start_age = parseInt(document.getElementById('p1_part_time_start_age').value) || undefined;
+  p.person1.part_time_end_age = parseInt(document.getElementById('p1_part_time_end_age').value) || undefined;
 
   p.person2.enabled = document.getElementById('p2_enabled').checked;
   p.person2.name = document.getElementById('p2_name').value;
@@ -3010,6 +3041,9 @@ function getProfileFromForm() {
   p.person2.life_expectancy = +document.getElementById('p2_life_expectancy').value || 90;
   p.person2.ss_fra_monthly = parseDollar(document.getElementById('p2_ss_fra_monthly').value);
   p.person2.annual_income = parseDollar(document.getElementById('p2_annual_income').value) || 0;
+  p.person2.part_time_income = parseDollar(document.getElementById('p2_part_time_income').value) || 0;
+  p.person2.part_time_start_age = parseInt(document.getElementById('p2_part_time_start_age').value) || undefined;
+  p.person2.part_time_end_age = parseInt(document.getElementById('p2_part_time_end_age').value) || undefined;
 
   // Pensions — read from dynamic cards
   const newPensions = JSON.parse(JSON.stringify(profile.pensions || []));
