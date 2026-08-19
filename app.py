@@ -8,7 +8,7 @@ Open: http://localhost:5000
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
-APP_VERSION = '1.0.4'
+APP_VERSION = '1.0.5'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.
@@ -25,13 +25,13 @@ CURRENT_DIR = _BASE_DIR
 DATA_FILE   = os.path.join(_DATA_DIR, 'profile.json')
 DATA_LOCK   = threading.Lock()   # serialize profile.json reads/writes
 
-# ─── TAX TABLES 2024 (MFJ) ────────────────────────────────────────────────────
+# ─── TAX TABLES 2026 (MFJ) — IRS Rev. Proc. 2025-32 ────────────────────────────────────────────────────
 
 FED_BRACKETS_MFJ = [
-    (23200, 0.10), (94300, 0.12), (201050, 0.22),
-    (383900, 0.24), (487450, 0.32), (731200, 0.35), (float('inf'), 0.37)
+    (24800, 0.10), (100800, 0.12), (211400, 0.22),
+    (403550, 0.24), (512450, 0.32), (768700, 0.35), (float('inf'), 0.37)
 ]
-FED_STD_DED = 29200
+FED_STD_DED = 32200
 
 # ─── STATE INCOME TAX DATA 2024 ───────────────────────────────────────────────
 # brackets: list of (upper_limit, marginal_rate) tuples, same format as federal.
@@ -161,6 +161,114 @@ STATE_TAX_DATA = {
            'std_ded_mfj':27700,'std_ded_single':14600,
            'ss_taxable_pct':0.0,'pension_excl_per_person':10000,'pension_excl_age':65},
 
+    # ── Added 2026: states previously missing (they silently fell back to NY) ──
+    # Rates/brackets/standard deductions: Tax Foundation "State Individual Income
+    # Tax Rates and Brackets, 2026" (IRS-conforming deductions noted where used).
+    # Where a state grants a personal *exemption* as a deduction it is folded
+    # into std_ded; credit-style exemptions are ignored.
+    # SS: ss_taxable_pct 0 means the state does not tax Social Security.
+    # Pension exclusions vary a lot by income and pension type; where a state's
+    # rule is income-tested or applies only to specific pension types, use the
+    # per-pension "state tax exempt" checkbox on the Profile tab instead.
+    'AL': {'name':'Alabama', 'type':'progressive',
+           'brackets_single':[(500,0.02),(3000,0.04),(_INF,0.05)],
+           'brackets_mfj':   [(1000,0.02),(6000,0.04),(_INF,0.05)],
+           'std_ded_single':4500,'std_ded_mfj':11500,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'AR': {'name':'Arkansas', 'type':'progressive',
+           'brackets_single':[(4600,0.02),(_INF,0.039)],
+           'brackets_mfj':   [(4600,0.02),(_INF,0.039)],
+           'std_ded_single':2470,'std_ded_mfj':4940,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':6000,'pension_excl_age':0},
+    'DE': {'name':'Delaware', 'type':'progressive',
+           'brackets_single':[(2000,0.0),(5000,0.022),(10000,0.039),(20000,0.048),
+                              (25000,0.052),(60000,0.0555),(_INF,0.066)],
+           'brackets_mfj':   [(2000,0.0),(5000,0.022),(10000,0.039),(20000,0.048),
+                              (25000,0.052),(60000,0.0555),(_INF,0.066)],
+           'std_ded_single':3250,'std_ded_mfj':6500,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':12500,'pension_excl_age':60},
+    'HI': {'name':'Hawaii', 'type':'progressive',
+           'brackets_single':[(9600,0.014),(14400,0.032),(19200,0.055),(24000,0.064),
+                              (36000,0.068),(48000,0.072),(125000,0.076),(175000,0.079),
+                              (225000,0.0825),(275000,0.09),(325000,0.10),(_INF,0.11)],
+           'brackets_mfj':   [(19200,0.014),(28800,0.032),(38400,0.055),(48000,0.064),
+                              (72000,0.068),(96000,0.072),(250000,0.076),(350000,0.079),
+                              (450000,0.0825),(550000,0.09),(650000,0.10),(_INF,0.11)],
+           'std_ded_single':4400,'std_ded_mfj':8800,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'ID': {'name':'Idaho', 'type':'progressive',
+           'brackets_single':[(4811,0.0),(_INF,0.053)],
+           'brackets_mfj':   [(9622,0.0),(_INF,0.053)],
+           'std_ded_single':16100,'std_ded_mfj':32200,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'KS': {'name':'Kansas', 'type':'progressive',
+           'brackets_single':[(23000,0.052),(_INF,0.0558)],
+           'brackets_mfj':   [(46000,0.052),(_INF,0.0558)],
+           'std_ded_single':12765,'std_ded_mfj':26560,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'LA': {'name':'Louisiana', 'type':'flat','rate':0.03,
+           'std_ded_single':12875,'std_ded_mfj':25750,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':6000,'pension_excl_age':65},
+    'MS': {'name':'Mississippi', 'type':'progressive',
+           'brackets_single':[(10000,0.0),(_INF,0.04)],
+           'brackets_mfj':   [(10000,0.0),(_INF,0.04)],
+           'std_ded_single':8300,'std_ded_mfj':16600,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':999999,'pension_excl_age':0},
+    'MT': {'name':'Montana', 'type':'progressive',
+           'brackets_single':[(47500,0.047),(_INF,0.0565)],
+           'brackets_mfj':   [(95000,0.047),(_INF,0.0565)],
+           'std_ded_single':16100,'std_ded_mfj':32200,
+           'ss_taxable_pct':0.85,'pension_excl_per_person':4640,'pension_excl_age':0},
+    'ND': {'name':'North Dakota', 'type':'progressive',
+           'brackets_single':[(48475,0.0),(244825,0.0195),(_INF,0.025)],
+           'brackets_mfj':   [(80975,0.0),(298075,0.0195),(_INF,0.025)],
+           'std_ded_single':16100,'std_ded_mfj':32200,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'NE': {'name':'Nebraska', 'type':'progressive',
+           'brackets_single':[(4130,0.0246),(24760,0.0351),(_INF,0.0455)],
+           'brackets_mfj':   [(8250,0.0246),(49530,0.0351),(_INF,0.0455)],
+           'std_ded_single':8850,'std_ded_mfj':17700,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'NM': {'name':'New Mexico', 'type':'progressive',
+           'brackets_single':[(5500,0.015),(16500,0.032),(33500,0.043),
+                              (66500,0.047),(210000,0.049),(_INF,0.059)],
+           'brackets_mfj':   [(8000,0.015),(25000,0.032),(50000,0.043),
+                              (100000,0.047),(315000,0.049),(_INF,0.059)],
+           'std_ded_single':16100,'std_ded_mfj':32200,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':8000,'pension_excl_age':65},
+    'OH': {'name':'Ohio', 'type':'progressive',
+           'brackets_single':[(26050,0.0),(_INF,0.0275)],
+           'brackets_mfj':   [(26050,0.0),(_INF,0.0275)],
+           'std_ded_single':2400,'std_ded_mfj':4800,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':0,'pension_excl_age':0},
+    'OK': {'name':'Oklahoma', 'type':'progressive',
+           'brackets_single':[(3750,0.0),(4900,0.025),(7200,0.035),(_INF,0.045)],
+           'brackets_mfj':   [(7500,0.0),(9800,0.025),(14400,0.035),(_INF,0.045)],
+           'std_ded_single':7350,'std_ded_mfj':14700,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':10000,'pension_excl_age':0},
+    'RI': {'name':'Rhode Island', 'type':'progressive',
+           'brackets_single':[(82050,0.0375),(186450,0.0475),(_INF,0.0599)],
+           'brackets_mfj':   [(82050,0.0375),(186450,0.0475),(_INF,0.0599)],
+           'std_ded_single':11200,'std_ded_mfj':22400,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':20000,'pension_excl_age':67},
+    'SC': {'name':'South Carolina', 'type':'progressive',
+           'brackets_single':[(3640,0.0),(18230,0.03),(_INF,0.06)],
+           'brackets_mfj':   [(3640,0.0),(18230,0.03),(_INF,0.06)],
+           'std_ded_single':8350,'std_ded_mfj':16700,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':10000,'pension_excl_age':65},
+    'VA': {'name':'Virginia', 'type':'progressive',
+           'brackets_single':[(3000,0.02),(5000,0.03),(17000,0.05),(_INF,0.0575)],
+           'brackets_mfj':   [(3000,0.02),(5000,0.03),(17000,0.05),(_INF,0.0575)],
+           'std_ded_single':8750,'std_ded_mfj':17500,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':12000,'pension_excl_age':65},
+    'WV': {'name':'West Virginia', 'type':'progressive',
+           'brackets_single':[(10000,0.0222),(25000,0.0296),(40000,0.0333),
+                              (60000,0.0444),(_INF,0.0482)],
+           'brackets_mfj':   [(10000,0.0222),(25000,0.0296),(40000,0.0333),
+                              (60000,0.0444),(_INF,0.0482)],
+           'std_ded_single':2000,'std_ded_mfj':4000,
+           'ss_taxable_pct':0.0,'pension_excl_per_person':8000,'pension_excl_age':0},
+
     # ── Custom / Other ─────────────────────────────────────────────────────
     'CUSTOM': {'name':'Custom / Other', 'type':'custom'},
 }
@@ -170,7 +278,15 @@ def get_state_tax_config(profile):
                ss_taxable_pct, pension_excl_per_person, pension_excl_age)
     for the state in the profile."""
     state  = profile.get('state', 'NY')
-    s      = STATE_TAX_DATA.get(state, STATE_TAX_DATA['NY'])
+    s      = STATE_TAX_DATA.get(state)
+    if s is None:
+        # An unrecognised state code used to fall through to New York — one of
+        # the highest-tax states, complete with NY's pension exclusion. That
+        # silently produced a wrong (and wrongly-shaped) tax bill with no
+        # warning. Fail to a neutral no-tax config instead; the UI restricts the
+        # dropdown to modelled states plus "Custom".
+        zero = [(float('inf'), 0.0)]
+        return zero, 0, zero, 0, 0.0, 0, 0
     stype  = s['type']
 
     if stype == 'none':
@@ -199,24 +315,24 @@ def get_state_tax_config(profile):
             s.get('pension_excl_per_person', 0),
             s.get('pension_excl_age', 0))
 
-# ─── TAX TABLES 2024 (Single filer — used after one spouse dies) ──────────────
+# ─── TAX TABLES 2026 (Single filer — used after one spouse dies) ──────────────
 
 FED_BRACKETS_SINGLE = [
-    (11600, 0.10), (47150, 0.12), (100525, 0.22),
-    (191950, 0.24), (243725, 0.32), (609350, 0.35), (float('inf'), 0.37)
+    (12400, 0.10), (50400, 0.12), (105700, 0.22),
+    (201775, 0.24), (256225, 0.32), (640600, 0.35), (float('inf'), 0.37)
 ]
-FED_STD_DED_SINGLE = 14600
+FED_STD_DED_SINGLE = 16100
 
 # Federal Long-Term Capital Gains brackets 2024 (MFJ)
 LTCG_BRACKETS_MFJ = [
-    (94050,  0.00),
-    (583750, 0.15),
+    (98900,  0.00),
+    (613700, 0.15),
     (float('inf'), 0.20),
 ]
 # Federal Long-Term Capital Gains brackets 2024 (Single)
 LTCG_BRACKETS_SINGLE = [
-    (47025,  0.00),
-    (518900, 0.15),
+    (49450,  0.00),
+    (545500, 0.15),
     (float('inf'), 0.20),
 ]
 # NYS taxes capital gains as ordinary income (no special rate)
@@ -386,6 +502,72 @@ def irmaa_annual_per_person(magi, use_single=False, threshold_factor=1.0, premiu
             return annual * premium_factor
     return table[-1][1] * premium_factor
 
+# ─── ACA PREMIUM TAX CREDIT ──────────────────────────────────────────────────
+# The enhanced (ARPA/IRA) subsidies expired 1 Jan 2026, so the pre-2021 rules
+# are back: a sliding scale from 100%–400% FPL and a HARD CLIFF above 400% —
+# one dollar over and the entire credit disappears.
+#
+# This matters enormously for Roth conversions before Medicare age: a conversion
+# raises MAGI, which raises the required contribution and can push a household
+# over the cliff. Without this, the Roth optimiser recommends conversions whose
+# true cost it cannot see.
+#
+# 2025 HHS poverty guidelines (used for 2026 coverage), 48 contiguous states.
+FPL_BASE_2025 = 15650.0
+FPL_ADD_2025  = 5500.0     # per additional household member
+
+# IRS Rev. Proc. 2025-25 applicable percentage table for 2026.
+# (fpl_ratio_upper, pct_at_lower_bound, pct_at_upper_bound) — linear in between.
+ACA_APPLICABLE_PCT_2026 = [
+    (1.33, 0.0210, 0.0210),
+    (1.50, 0.0314, 0.0419),
+    (2.00, 0.0419, 0.0660),
+    (2.50, 0.0660, 0.0844),
+    (3.00, 0.0844, 0.0996),
+    (4.00, 0.0996, 0.0996),
+]
+ACA_CLIFF_FPL = 4.00
+
+def federal_poverty_level(household_size, inflation=0.0, years=0):
+    """FPL for a household, optionally indexed forward."""
+    n = max(1, int(household_size))
+    base = FPL_BASE_2025 + FPL_ADD_2025 * (n - 1)
+    return base * ((1 + inflation) ** years)
+
+def aca_applicable_pct(fpl_ratio):
+    """Share of MAGI the household is expected to contribute toward the
+    benchmark plan. Returns None above the 400% FPL cliff (no credit)."""
+    if fpl_ratio > ACA_CLIFF_FPL:
+        return None
+    prev_upper = 1.0
+    for upper, pct_lo, pct_hi in ACA_APPLICABLE_PCT_2026:
+        if fpl_ratio <= upper:
+            if upper == prev_upper or pct_hi == pct_lo:
+                return pct_lo
+            frac = (fpl_ratio - prev_upper) / (upper - prev_upper)
+            return pct_lo + frac * (pct_hi - pct_lo)
+        prev_upper = upper
+    return ACA_APPLICABLE_PCT_2026[-1][2]
+
+def aca_subsidy(magi, benchmark_premium, household_size,
+                inflation=0.0, years=0):
+    """Annual premium tax credit.
+
+    Returns (credit, fpl_ratio, over_cliff). The credit is the benchmark
+    premium less the household's required contribution, floored at zero.
+    """
+    if benchmark_premium <= 0:
+        return 0.0, 0.0, False
+    fpl = federal_poverty_level(household_size, inflation, years)
+    if fpl <= 0:
+        return 0.0, 0.0, False
+    ratio = max(0.0, magi) / fpl
+    pct = aca_applicable_pct(ratio)
+    if pct is None:
+        return 0.0, ratio, True          # over the cliff — no credit at all
+    required = max(0.0, magi) * pct
+    return max(0.0, benchmark_premium - required), ratio, False
+
 def ss_monthly_at_age(fra_monthly, take_age, fra_age=67):
     """SS monthly benefit adjusted for early/late claiming."""
     months = (take_age - fra_age) * 12
@@ -437,6 +619,22 @@ def taxable_ss_portion(ss_annual, other_income, use_single=False):
     else:
         return min(0.85 * ss_annual,
                    0.85 * (combined - t2) + min(0.5 * ss_annual, addon_cap))
+
+# ─── NET INVESTMENT INCOME TAX (NIIT) ────────────────────────────────────────
+# 3.8% on the LESSER of net investment income or MAGI above the threshold.
+# These thresholds are set in statute and are NOT inflation-indexed.
+NIIT_RATE = 0.038
+NIIT_THRESHOLD_MFJ = 250000.0
+NIIT_THRESHOLD_SINGLE = 200000.0
+
+def niit_tax(net_investment_income, magi, use_single=False):
+    """Additional 3.8% Medicare surtax on investment income."""
+    if net_investment_income <= 0:
+        return 0.0
+    threshold = NIIT_THRESHOLD_SINGLE if use_single else NIIT_THRESHOLD_MFJ
+    excess = max(0.0, magi - threshold)
+    return NIIT_RATE * min(net_investment_income, excess)
+
 
 def rmd_start_age(birth_year):
     """SECURE 2.0 required-beginning age: 73 for those born 1951-1959,
@@ -619,7 +817,7 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
     for yr in range(curr_yr, end_year + 1):
         p1a = yr - p1b
         p2a = yr - p2b
-        yrs_since_2024 = yr - 2024
+        yrs_since_2024 = yr - 2026   # anchor year for the 2026 tax tables
 
         p1_ret = yr >= p1_retire_yr
         # P2 only "retires" if they exist. `both_ret` means "nobody in the
@@ -723,14 +921,24 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         p1_med = (per_post if p1a >= med_age else per_pre) * med_factor if (p1_ret and p1_alive) else 0
         p2_med = (per_post if p2a >= med_age else per_pre) * med_factor if (p2_enabled and p2_ret and p2_alive) else 0
 
-        # ACA premiums: cover the gap between early retirement and Medicare age
-        aca_exp = 0.0
+        # ACA premiums: cover the gap between early retirement and Medicare age.
+        # aca_gross is the full benchmark premium; any premium tax credit is
+        # applied inside the withdrawal loop below, because the credit depends
+        # on MAGI, which depends on how much is withdrawn/converted.
+        aca_gross = 0.0
+        aca_members = 0
         if aca_on and aca_mo > 0:
             aca_factor = (1 + aca_inf) ** med_yrs
             if p1_ret and p1_alive and p1a < med_age:
-                aca_exp += aca_mo * 12 * aca_factor
+                aca_gross += aca_mo * 12 * aca_factor
+                aca_members += 1
             if p2_enabled and p2_ret and p2_alive and p2a < med_age:
-                aca_exp += aca_mo * 12 * aca_factor
+                aca_gross += aca_mo * 12 * aca_factor
+                aca_members += 1
+        # Household size for FPL: living people in the tax household
+        aca_household = (1 if p1_alive else 0) + (1 if (p2_enabled and p2_alive) else 0)
+        aca_household = max(1, aca_household)
+        aca_exp = aca_gross          # refined below once MAGI is known
 
         # Long-term care expenses
         ltc_exp = 0.0
@@ -919,6 +1127,12 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         bal_snap   = dict(bal)
         basis_snap = dict(basis)
 
+        # ACA credit state — resolved inside the loop once MAGI is known.
+        exp_base       = exp     # expenses assuming the FULL benchmark premium
+        aca_credit     = 0.0
+        aca_fpl_ratio  = 0.0
+        aca_over_cliff = False
+
         extra_for_tax = 0.0     # additional amount to cover tax
         total_tax     = 0.0
         fed_tax       = 0.0
@@ -1004,9 +1218,25 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             st_taxable   = max(0.0, st_pen_inc + trad_w + savings_interest
                                + taxable_gains + taxable_wages + st_ss - st_excl_used)
 
-            fed_tax   = calc_tax(fed_income, fb, fd) + fed_ltcg_tax
+            fed_niit  = niit_tax(taxable_gains + savings_interest,
+                                 fed_income + taxable_gains, use_single)
+            fed_tax   = calc_tax(fed_income, fb, fd) + fed_ltcg_tax + fed_niit
             state_tax = calc_tax(st_taxable, nb, nd)
             total_tax = fed_tax + state_tax + total_fica
+
+            # ── ACA premium tax credit ───────────────────────────────────────
+            # MAGI for ACA = AGI + non-taxable Social Security. Recomputed each
+            # pass so the credit reflects this iteration's withdrawals; the loop
+            # then converges on a consistent (spending, MAGI, credit) triple.
+            if aca_gross > 0:
+                aca_magi = max(0.0, fed_income + taxable_gains + (total_ss - tx_ss))
+                _credit, _ratio, _over = aca_subsidy(
+                    aca_magi, aca_gross, aca_household, inflation, med_yrs)
+                aca_credit    = _credit
+                aca_fpl_ratio = _ratio
+                aca_over_cliff = _over
+                aca_exp = max(0.0, aca_gross - aca_credit)
+            exp = exp_base - (aca_gross - aca_exp)
 
             # Check: did we withdraw enough to cover expenses + tax?
             gross_income = guaranteed + sum(w.values())
@@ -1066,6 +1296,24 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                     # Gains stack on top of ordinary income, so headroom is
                     # measured against the full stack.
                     room = bracket_room(fed_stack, target_rate, fb, fd)
+
+                # ── ACA subsidy cliff guard ──────────────────────────────────
+                # Before Medicare, a conversion raises MAGI. Cross 400% FPL and
+                # the ENTIRE premium tax credit vanishes — frequently a far
+                # bigger hit than the bracket-fill saves. Cap the conversion at
+                # the cliff unless the household is already above it (nothing
+                # left to lose) or the user opts out.
+                if (aca_gross > 0 and room > 0
+                        and bool(profile.get('roth_respect_aca_cliff', True))):
+                    _magi_now = max(0.0, fed_income + taxable_gains + (total_ss - tx_ss))
+                    _fpl = federal_poverty_level(aca_household, inflation, med_yrs)
+                    _cliff_magi = ACA_CLIFF_FPL * _fpl
+                    if _magi_now <= _cliff_magi:
+                        headroom = max(0.0, _cliff_magi - _magi_now)
+                        if headroom < room:
+                            room = headroom
+                            roth_conv_note = 'aca_cliff_capped'
+
                 if room > 0:
                     roth_conv = min(room, trad_bal_total, 250000)
 
@@ -1144,6 +1392,23 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
         # Pre-Roth tax = the amount the gross-up loop was designed to cover.
         # Roth conversion tax is a strategic cost, not a spending cost, so
         # net_income (which measures "can I cover expenses?") uses pre-Roth tax.
+        # ── Re-price the ACA credit now that the conversion is known ─────────
+        # A conversion is MAGI. Even after the cliff guard, filling a bracket
+        # raises the required contribution and shrinks the credit; that lost
+        # subsidy is a real cost of converting and is reported alongside the
+        # conversion tax rather than being quietly ignored.
+        aca_subsidy_lost = 0.0
+        if aca_gross > 0 and roth_conv > 0:
+            _magi_post = max(0.0, fed_income + taxable_gains + (total_ss - tx_ss))
+            _c2, _r2, _o2 = aca_subsidy(_magi_post, aca_gross, aca_household,
+                                        inflation, med_yrs)
+            aca_subsidy_lost = max(0.0, aca_credit - _c2)
+            aca_credit     = _c2
+            aca_fpl_ratio  = _r2
+            aca_over_cliff = _o2
+            aca_exp        = max(0.0, aca_gross - aca_credit)
+            exp            = exp_base - (aca_gross - aca_exp)
+
         tax_pre_roth = total_tax
         # Component split of the spending tax bill, for the cash-flow plan.
         # (The incremental Roth conversion tax is reported separately, since it
@@ -1300,8 +1565,15 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
                    if phase_mult != 1 else 'Base spending'))
         _add('medical', p1_med + p2_med, flow='out', label='Medical costs',
              note='Out-of-pocket healthcare')
-        _add('aca', aca_exp, flow='out', label='ACA premiums',
-             note='Pre-Medicare health insurance')
+        if aca_credit > 0:
+            _add('aca', aca_gross, flow='out', label='ACA premiums (full price)',
+                 note='Pre-Medicare health insurance, before subsidy')
+            _add('aca_subsidy', aca_credit, flow='in', label='ACA premium tax credit',
+                 note=f'Subsidy at {aca_fpl_ratio:.0%} of the federal poverty level')
+        else:
+            _add('aca', aca_exp, flow='out', label='ACA premiums',
+                 note=('No subsidy — income is over the 400% FPL cliff'
+                       if aca_over_cliff else 'Pre-Medicare health insurance'))
         _add('ltc', ltc_exp, flow='out', label='Long-term care',
              note='Net of any LTC insurance')
         _add('irmaa', irmaa_cost, flow='out', label='IRMAA surcharge',
@@ -1343,6 +1615,11 @@ def project(profile, ss1_age_override=None, ss2_age_override=None, do_roth=True)
             'medical_expenses': round(medical_exp),
             'irmaa_cost': round(irmaa_cost),
             'aca_expense': round(aca_exp),
+            'aca_gross_premium': round(aca_gross),
+            'aca_subsidy': round(aca_credit),
+            'aca_fpl_ratio': round(aca_fpl_ratio, 2),
+            'aca_over_cliff': bool(aca_over_cliff and aca_gross > 0),
+            'aca_subsidy_lost_to_conversion': round(aca_subsidy_lost),
             'ltc_expense': round(ltc_exp),
             'spending_multiplier': round(phase_mult, 2),
             'pension1': round(pen1_inc),
@@ -1900,6 +2177,28 @@ def validate_profile(data):
     """
     if not isinstance(data, dict):
         return False, 'not an object'
+
+    # Reject non-finite numbers anywhere in the payload. json.dumps happily
+    # writes NaN/Infinity, but those are not valid strict JSON and every later
+    # read of profile.json would produce silently wrong arithmetic.
+    def _finite(node, path='profile'):
+        if isinstance(node, float):
+            if math.isnan(node) or math.isinf(node):
+                return False, f'{path} is not a finite number'
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                ok, why = _finite(v, f'{path}.{k}')
+                if not ok:
+                    return False, why
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                ok, why = _finite(v, f'{path}[{i}]')
+                if not ok:
+                    return False, why
+        return True, ''
+    ok, why = _finite(data)
+    if not ok:
+        return False, why
     for key in ('person1', 'person2'):
         if key in data and not isinstance(data[key], dict):
             return False, f'{key} must be an object'
@@ -2101,10 +2400,11 @@ class Handler(BaseHTTPRequestHandler):
                 gr_boost   = max(0.0, min(0.30, _num(data.get('gr_boost'), 0.10)))
                 gr_floor   = max(0.50, min(1.00, _num(data.get('gr_floor'), 0.85)))
                 gr_ceil    = max(1.00, min(2.00, _num(data.get('gr_ceil'),  1.25)))
+                infl_vol   = max(0.0, min(0.10, _num(data.get('inflation_vol'), 0.0)))
                 result     = monte_carlo(data, n_sims=n_sims, volatility=vol,
                                          guardrails=True, gr_cut=gr_cut,
                                          gr_boost=gr_boost, gr_floor=gr_floor,
-                                         gr_ceil=gr_ceil)
+                                         gr_ceil=gr_ceil, inflation_vol=infl_vol)
                 self.send_json(result)
             except Exception:
                 self._fail('Monte Carlo simulation failed')
@@ -2115,7 +2415,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
                  guardrails=False, gr_upper=1.20, gr_lower=0.80,
-                 gr_cut=0.10, gr_boost=0.10, gr_floor=0.85, gr_ceil=1.25):
+                 gr_cut=0.10, gr_boost=0.10, gr_floor=0.85, gr_ceil=1.25,
+                 all_infl=None):
     """
     Replay a pre-generated shock matrix against the withdrawal schedule.
     Returns percentiles, success stats, and guardrail trigger info.
@@ -2130,7 +2431,8 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
     trigger_years  = 0       # total sim-years a guardrail actually moved spending
     total_adj      = 0.0     # cumulative adjustment factor (for avg)
 
-    for shocks in all_shocks:
+    for _sim_idx, shocks in enumerate(all_shocks):
+        infl_path   = all_infl[_sim_idx] if all_infl is not None else None
         bal         = float(start_bal)
         sim_bals    = []
         depleted_at = None
@@ -2141,6 +2443,12 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
 
         for i in range(n_years):
             base_w = withdrawals[i]
+            # Inflation risk: the deterministic schedule assumes one fixed
+            # inflation rate forever. When inflation runs hot, the same real
+            # lifestyle costs more nominal dollars, so the required withdrawal
+            # scales up on that path.
+            if all_infl is not None:
+                base_w *= infl_path[i]
 
             if initial_wr is None and base_w > 0 and bal > 0:
                 initial_wr = base_w / bal
@@ -2204,7 +2512,7 @@ def _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
 def monte_carlo(profile, n_sims=500, volatility=0.12,
                 guardrails=False, gr_cut=0.10, gr_boost=0.10,
                 gr_floor=0.85, gr_ceil=1.25,
-                gr_upper=1.20, gr_lower=0.80):
+                gr_upper=1.20, gr_lower=0.80, inflation_vol=0.0):
     """
     Monte Carlo simulation with optional dynamic-spending guardrails.
 
@@ -2220,6 +2528,7 @@ def monte_carlo(profile, n_sims=500, volatility=0.12,
         → boost spending by gr_boost, ceiling at gr_ceil.
     """
     base     = project(profile)
+    base_inflation = float(profile.get('inflation', 0.03) or 0.0)
     ret_rows = [r for r in base if r['phase'] == 'retirement']
     pre_rows = [r for r in base if r['phase'] == 'accumulation']
 
@@ -2256,13 +2565,30 @@ def monte_carlo(profile, n_sims=500, volatility=0.12,
         for _ in range(n_sims)
     ]
 
-    base_res = _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages)
+    # ── Inflation paths ───────────────────────────────────────────────────
+    # Each year's inflation is drawn around the planning assumption; the
+    # cumulative deviation from that assumption scales the nominal spending
+    # need. inflation_vol = 0 reproduces the old fixed-inflation behaviour.
+    all_infl = None
+    if inflation_vol > 0:
+        all_infl = []
+        for _ in range(n_sims):
+            cum, path = 1.0, []
+            for _y in range(n_years):
+                shock = random.gauss(0.0, inflation_vol)
+                cum *= (1.0 + shock / (1.0 + base_inflation))
+                path.append(max(0.25, min(4.0, cum)))
+            all_infl.append(path)
+
+    base_res = _run_sim_set(all_shocks, start_bal, withdrawals, drift, ages,
+                            all_infl=all_infl)
 
     result = {
         'ok':              True,
         'ages':            ages,
         'n_sims':          n_sims,
         'volatility':      round(volatility * 100, 1),
+        'inflation_vol':   round(inflation_vol * 100, 1),
         'base_growth_pct': round(base_growth * 100, 2),
         'guardrails_enabled': guardrails,
         **{k: base_res[k] for k in [
@@ -2279,6 +2605,7 @@ def monte_carlo(profile, n_sims=500, volatility=0.12,
             gr_upper=gr_upper, gr_lower=gr_lower,
             gr_cut=gr_cut,    gr_boost=gr_boost,
             gr_floor=gr_floor, gr_ceil=gr_ceil,
+            all_infl=all_infl,
         )
         result.update({
             'percentiles_gr':        gr_res['percentiles'],

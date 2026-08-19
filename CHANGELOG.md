@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.5] - 2026-08-19
+
+### Fixed — 18 states were silently taxed as New York
+- `get_state_tax_config` fell back to New York for any state code it did not recognise. Alabama, Arkansas, Delaware, Hawaii, Idaho, Kansas, Louisiana, Mississippi, Montana, Nebraska, New Mexico, North Dakota, Ohio, Oklahoma, Rhode Island, South Carolina, Virginia and West Virginia all received New York's progressive brackets **and** New York's $20,000 pension exclusion, with no warning — despite the README claiming all 50 states were supported. All 18 now have real 2026 brackets, standard deductions and Social Security treatment (source: Tax Foundation, *State Individual Income Tax Rates and Brackets, 2026*), and an unrecognised code now falls back to a neutral no-tax configuration instead of impersonating a high-tax state.
+
+### Added — ACA premium tax credit (and the subsidy cliff)
+- The enhanced ARPA/IRA subsidies expired 1 January 2026, so the **400% FPL cliff is back**. The engine previously charged the full benchmark premium with no credit at all, badly overstating pre-Medicare healthcare costs for most early retirees.
+- Premium tax credits are now modelled on the 2026 applicable-percentage table (IRS Rev. Proc. 2025-25) against 2025 HHS poverty guidelines, resolved inside the withdrawal loop so the credit and the spending need converge together.
+- **Roth conversions now respect the cliff.** A conversion is MAGI: cross 400% FPL and the entire credit disappears, which routinely costs far more than a bracket-fill saves. Conversions are capped at the cliff by default (`roth_respect_aca_cliff`, set it to `false` to opt out), and any subsidy still lost to a conversion is reported as `aca_subsidy_lost_to_conversion` rather than ignored. In a test profile the guard preserved **$155,000** of lifetime subsidy and about **$1.08M** of ending balance.
+- New per-year fields: `aca_gross_premium`, `aca_subsidy`, `aca_fpl_ratio`, `aca_over_cliff`. The Cash Flow Plan shows the full premium and the credit as separate lines.
+
+### Added — regression test suite
+- `test_app.py`: 54 tests, standard library only, runs in under a second (`python3 test_app.py`). Every assertion pins either an officially published figure (SSA reduction percentages, NYSLRS reduction tables and benefit formulas, IRS 2026 brackets and NIIT thresholds, ACA applicable percentages) or an invariant that a past bug violated — cash-flow reconciliation, conversion funding, the SS optimizer score, and the New York fallback. There were previously no tests of any kind.
+
+### Added — other
+- **Net Investment Income Tax**: 3.8% on the lesser of investment income or MAGI above $250,000 (MFJ) / $200,000 (single), thresholds unindexed as in statute.
+- **Inflation is now a modelled risk in Monte Carlo.** Set `inflation_vol` to draw each year's inflation around the planning assumption; the nominal spending need scales along each path. Defaults to 0, which reproduces prior behaviour.
+
+### Changed
+- Federal tables updated from 2024 to **2026** actuals (Rev. Proc. 2025-32): MFJ standard deduction $32,200, single $16,100, and the 2026 ordinary and long-term capital gains brackets. The inflation anchor moved from 2024 to 2026, so brackets are no longer projected forward from two-year-old figures.
+- `validate_profile` now rejects `NaN` and `Infinity` anywhere in the payload. These previously passed validation and were written to `profile.json`, which is invalid strict JSON and silently corrupted every later calculation.
+
+### Note
+- The Monte Carlo variance-drag concern raised in review had already been fixed in 1.0.2 (returns are lognormal, so the drag is applied exactly once). A test now pins that behaviour so it cannot regress.
+
+---
+
 ## [1.0.4] - 2026-08-19
 
 ### Added — Cash Flow Plan (every dollar that moves)
