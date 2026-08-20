@@ -8,7 +8,7 @@ Open: http://localhost:5000
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, math, os, copy, random, sys, threading, traceback, webbrowser
 
-APP_VERSION = '1.0.7'
+APP_VERSION = '1.0.8'
 PORT = 5000
 
 # When bundled with PyInstaller, data files live in sys._MEIPASS.

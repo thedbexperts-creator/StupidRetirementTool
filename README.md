@@ -1,6 +1,6 @@
 # 🏠 Retirement Planner
 
-**Version 1.0.7**
+**Version 1.0.8**
 
 A free, offline retirement planning tool that runs locally on your computer.
 No accounts, no subscriptions, no data ever leaves your machine.

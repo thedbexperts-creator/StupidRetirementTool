@@ -760,6 +760,7 @@
     <div id="no-data-ss" class="text-muted text-center py-3">Click "Run SS Optimization" to compare start ages.</div>
     <div id="ss-content" style="display:none">
       <div class="row g-3 mb-3" id="ss-recommendation"></div>
+      <div id="ss-apply-bar" class="mb-3" style="display:none"></div>
 
       <!-- Individual Analysis: Person 1 -->
       <div class="card mb-3">
@@ -1581,6 +1582,7 @@
         <div id="nys_calc_result" style="display:none;">
           <hr class="my-2">
           <div class="row g-2 mb-3" id="nys_result_metrics"></div>
+          <div id="nys-apply-bar" class="mb-3"></div>
           <div class="mb-1 fw-bold" style="font-size:12px;color:#1a2744;">
             Impact of When You Start Collecting
             <span class="fw-normal text-muted ms-1" style="font-size:11px;">(service &amp; FAS are fixed at your leave age — only the early-reduction changes)</span>
@@ -4014,11 +4016,162 @@ async function runOptimizeSSOnly() {
   } finally { hideLoading(); }
 }
 
+// ── Apply calculated results back into the profile ───────────────────────────
+// Both flows write into the in-memory `profile` and refresh the Profile tab.
+// Nothing is persisted until you hit Save, so an accidental click is undoable
+// by reloading.
+
+let _ssRecommended = null;
+
+function renderSSApplyBar(recommended) {
+  _ssRecommended = recommended || null;
+  const bar = document.getElementById('ss-apply-bar');
+  if (!bar) return;
+  if (!_ssRecommended) { bar.style.display = 'none'; return; }
+
+  const cur1 = profile.strategy?.ss1_age;
+  const cur2 = profile.strategy?.ss2_age;
+  const p2On = profile.person2?.enabled !== false;
+  const same = cur1 === _ssRecommended.ss1_age &&
+               (!p2On || cur2 === _ssRecommended.ss2_age);
+
+  bar.style.display = '';
+  bar.innerHTML = same
+    ? `<div class="insight-box good" style="margin-bottom:0">
+         &#10003; Your profile already uses these claiming ages.
+       </div>`
+    : `<div class="insight-box" style="margin-bottom:0;display:flex;flex-wrap:wrap;
+              gap:12px;align-items:center;justify-content:space-between">
+         <span>
+           Apply the recommended claiming ages to your profile —
+           <strong>${profile.person1?.name || 'Person 1'}</strong>
+           ${cur1 ?? '—'} &rarr; <strong>${_ssRecommended.ss1_age}</strong>${
+             p2On ? `, <strong>${profile.person2?.name || 'Person 2'}</strong>
+           ${cur2 ?? '—'} &rarr; <strong>${_ssRecommended.ss2_age}</strong>` : ''}
+         </span>
+         <button type="button" class="btn btn-sm btn-primary" onclick="applySSToProfile()">
+           Update Profile
+         </button>
+       </div>`;
+}
+
+function applySSToProfile() {
+  if (!_ssRecommended) return;
+  profile.strategy = profile.strategy || {};
+  const p2On = profile.person2?.enabled !== false;
+  profile.strategy.ss1_age = _ssRecommended.ss1_age;
+  if (p2On) profile.strategy.ss2_age = _ssRecommended.ss2_age;
+
+  renderProfile();
+  renderSSApplyBar(_ssRecommended);
+  notify('Claiming ages updated in your profile. Re-run Calculate Plan to see the impact, then Save to keep it.', 'success');
+}
+
+// ── NYS pension → profile ────────────────────────────────────────────────────
+let _nysResult = null;
+
+function renderNYSApplyBar(data) {
+  _nysResult = data || null;
+  const bar = document.getElementById('nys-apply-bar');
+  if (!bar || !_nysResult) return;
+
+  const pens = profile.pensions || [];
+  const opts = pens.map((p, i) => {
+    const who = p.owner === 'p2'
+      ? (profile.person2?.name || 'Person 2')
+      : (profile.person1?.name || 'Person 1');
+    return `<option value="${i}">${p.name || 'Pension ' + (i + 1)} (${who})</option>`;
+  }).join('');
+
+  bar.innerHTML = `
+    <div class="insight-box" style="margin-bottom:0">
+      <div class="d-flex flex-wrap gap-2 align-items-end">
+        <div style="min-width:230px">
+          <label class="form-label mb-1" style="font-size:12px;font-weight:600">
+            Apply this pension to
+          </label>
+          <select class="form-select form-select-sm" id="nys_apply_target"
+                  onchange="renderNYSApplyPreview()">
+            ${opts}
+            <option value="new">+ Create a new pension</option>
+          </select>
+        </div>
+        <button type="button" class="btn btn-sm btn-primary" onclick="applyNYSToProfile()">
+          Update Profile
+        </button>
+      </div>
+      <div id="nys_apply_preview" style="font-size:12px;margin-top:8px"></div>
+    </div>`;
+  renderNYSApplyPreview();
+}
+
+function renderNYSApplyPreview() {
+  if (!_nysResult) return;
+  const el = document.getElementById('nys_apply_preview');
+  const sel = document.getElementById('nys_apply_target');
+  if (!el || !sel) return;
+  const p = _nysResult.planned;
+  const isNew = sel.value === 'new';
+  // A freshly-rendered <select> may not have a value set yet; fall back to the
+  // first pension rather than silently losing the "before" figures.
+  const idx = parseInt(sel.value, 10);
+  const target = isNew ? null
+    : (profile.pensions || [])[Number.isInteger(idx) ? idx : 0];
+
+  const row = (label, from, to) => `
+    <div style="display:flex;gap:8px;align-items:baseline">
+      <span style="min-width:120px;color:#5a6a8c">${label}</span>
+      ${from !== null && from !== undefined && String(from) !== String(to)
+        ? `<span class="text-muted"><s>${from}</s></span> <span>&rarr;</span>` : ''}
+      <strong>${to}</strong>
+    </div>`;
+
+  el.innerHTML = `
+    <div style="color:#5a6a8c;margin-bottom:4px">
+      ${isNew ? 'A new pension will be added:' : 'This pension will be changed to:'}
+    </div>
+    ${row('Monthly benefit', target ? fmt(target.monthly_benefit || 0) : null,
+          fmt(p.monthly_benefit))}
+    ${row('Start age', target ? (target.start_age ?? '—') : null, p.benefit_age)}
+    <div class="text-muted" style="margin-top:6px">
+      Name, owner, COLA and survivor benefit are left as they are.
+      Nothing is saved until you press Save.
+    </div>`;
+}
+
+function applyNYSToProfile() {
+  if (!_nysResult) return;
+  const sel = document.getElementById('nys_apply_target');
+  if (!sel) return;
+  const p = _nysResult.planned;
+  profile.pensions = profile.pensions || [];
+
+  let pen;
+  if (sel.value === 'new') {
+    pen = { name: _nysResult.tier_label || 'NYS Pension', owner: 'p1',
+            monthly_benefit: 0, survivor_monthly: 0, start_age: 65,
+            cola: 0.0, nys_exempt: true };
+    profile.pensions.push(pen);
+  } else {
+    const i = parseInt(sel.value, 10);
+    pen = profile.pensions[Number.isInteger(i) ? i : 0];
+    if (!pen) { notify('That pension no longer exists — pick another.', 'warning'); return; }
+  }
+
+  pen.monthly_benefit = Math.round(p.monthly_benefit);
+  pen.start_age       = Math.round(p.benefit_age);
+
+  renderProfile();
+  renderNYSApplyBar(_nysResult);
+  notify(`Pension updated: ${fmt(pen.monthly_benefit)}/mo starting at age ${pen.start_age}. Re-run Calculate Plan, then Save to keep it.`, 'success');
+}
+
 function renderSSOptimizer(data) {
   document.getElementById('no-data-ss').style.display = 'none';
   document.getElementById('ss-content').style.display = '';
 
   const { comparisons, recommended, individual_p1, individual_p2 } = data;
+  renderSSApplyBar(recommended);
   const p1Name = profile.person1?.name || 'Person 1';
   const p2Name = profile.person2?.name || 'Person 2';
   const p1FRA  = profile.person1?.fra_age || 67;
@@ -4452,6 +4605,7 @@ async function calcNYSPension() {
 function renderNYSPensionResult(data) {
   const p = data.planned;
   document.getElementById('nys_calc_result').style.display = '';
+  renderNYSApplyBar(data);
   document.getElementById('nys_fas_yrs').textContent = data.fas_years;
 
   // Did deferring help?

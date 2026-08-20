@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.8] - 2026-08-19
+
+### Added — "Update Profile" on the optimizer pages
+Both calculators produced numbers you then had to retype into the Profile tab by hand. They now write back directly.
+
+- **Social Security Optimizer** — an apply bar under the recommendation cards shows the change in plain terms (*"Dave 67 → 70, Sam 67 → 68"*) with an **Update Profile** button that writes both recommended claiming ages into the profile strategy. When the profile already matches, it says so instead of offering a pointless button. Respects a single-person profile: Person 2's age is never written when Person 2 is disabled.
+- **NYS Pension Calculator** — an apply panel with a dropdown of your existing pensions (by name and owner) plus a **"Create a new pension"** option. A live preview shows exactly what will change, striking through the old monthly benefit and start age, before you commit. Applies the calculated monthly benefit and benefit start age; name, owner, COLA and survivor benefit are left untouched.
+
+Neither button persists anything on its own — changes land in the working profile and the Profile tab refreshes, so an accidental click is undone by reloading. Both prompt you to re-run Calculate Plan and Save.
+
+### Fixed
+- Hardened the pension target lookup: a freshly rendered `<select>` without an explicit value parsed to `NaN`, which silently dropped the "before" figures from the preview. Both the preview and the apply path now fall back to the first pension. Caught by a headless test of the apply logic.
+
+---
+
 ## [1.0.7] - 2026-08-19
 
 ### Added — the after-tax value is now visible
